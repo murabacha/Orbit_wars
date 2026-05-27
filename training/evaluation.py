@@ -45,20 +45,28 @@ def evaluate_agent(agent_weights: str = None, num_games: int = 100):
         baseline2 = HeuristicBaseline(2)
         baseline3 = HeuristicBaseline(3)
 
-        # If weights provided, we can create a policy wrapper closure
-        def learner_agent(obs, config):
-            # Try simple heuristic fallback if model not loaded
+        # Prepare learner policy once per evaluation (load weights if provided)
+        policy = None
+        if agent_weights:
             try:
-                # Minimal inference: use heuristic mapping if no model
-                # The repository's policy expects processed tensors; for evaluation fallback to heuristic
                 from orbit_wars_ai.agents.transformer_ppo.policy import TransformerPPOPolicy
-                policy = TransformerPPOPolicy(device='cpu')
-                if agent_weights:
-                    policy.model.load_state_dict(torch.load(agent_weights, map_location='cpu'))
-                processed = obs_proc.process(obs, 0)
-                tgt, alloc, _, _ = policy.get_action(processed)
-                return act_proc.process_actions(obs, 0, [tgt], [alloc])
+                from orbit_wars_ai.agents.transformer_ppo.config import TransformerPPOConfig
+                cfg = TransformerPPOConfig()
+                policy = TransformerPPOPolicy(cfg, device='cpu')
+                policy.model.load_state_dict(torch.load(agent_weights, map_location='cpu'))
+                policy.model.eval()
             except Exception:
+                policy = None
+
+        def learner_agent(obs, config):
+            if policy is not None:
+                try:
+                    processed = obs_proc.process(obs, 0)
+                    tgt, alloc, _, _ = policy.get_action(processed)
+                    return act_proc.process_actions(obs, 0, [tgt], [alloc])
+                except Exception:
+                    return HeuristicBaseline(0).act(obs)
+            else:
                 return HeuristicBaseline(0).act(obs)
 
         agents = [learner_agent, lambda o, c: baseline1.act(o), lambda o, c: baseline2.act(o), lambda o, c: baseline3.act(o)]

@@ -113,38 +113,40 @@ def collect_rollouts(num_transitions, save_path, max_entities=200):
                         source_id, angle, ships_to_send = m
                     except Exception:
                         continue
-                        source_planet = next((p for p in planets if p[0] == source_id), None)
-                        if source_planet is None:
-                            continue
-                        sx, sy = source_planet[2], source_planet[3]
+                    source_planet = next((p for p in planets if p[0] == source_id), None)
+                    if source_planet is None:
+                        continue
+                    sx, sy = source_planet[2], source_planet[3]
 
-                        target_id = None
-                        best_diff = float('inf')
-                        for p in planets:
-                            if p[0] == source_id:
-                                continue
-                            tx, ty = p[2], p[3]
-                            a = angle_between(sx, sy, tx, ty)
-                            diff = abs(((a - angle + math.pi) % (2 * math.pi)) - math.pi)
-                            if diff < best_diff:
-                                best_diff = diff
-                                target_id = p[0]
-
-                        if target_id is None:
+                    target_id = None
+                    best_diff = float('inf')
+                    for p in planets:
+                        if p[0] == source_id:
                             continue
-                        if target_id not in raw_entity_ids:
-                            continue
-                        t_index = raw_entity_ids.index(target_id)
-                        entity_ids_list.append(processed['entity_ids'])
-                        mask_list.append(processed['mask'])
-                        target_list.append(t_index)
-                        alloc_list.append(alloc_idx)
+                        tx, ty = p[2], p[3]
+                        a = angle_between(sx, sy, tx, ty)
+                        diff = abs(((a - angle + math.pi) % (2 * math.pi)) - math.pi)
+                        if diff < best_diff:
+                            best_diff = diff
+                            target_id = p[0]
 
-                        collected += 1
-                        if collected % 1000 == 0:
-                            print(f"Collected {collected} samples")
-                        if collected >= num_transitions:
-                            break
+                    if target_id is None:
+                        continue
+                    if target_id not in raw_entity_ids:
+                        continue
+                    t_index = raw_entity_ids.index(target_id)
+                    alloc_idx = alloc_to_index(ships_to_send, source_planet[5])
+                    entities_list.append(processed['entities'])
+                    entity_ids_list.append(processed['entity_ids'])
+                    mask_list.append(processed['mask'])
+                    target_list.append(t_index)
+                    alloc_list.append(alloc_idx)
+
+                    collected += 1
+                    if collected % 1000 == 0:
+                        print(f"Collected {collected} samples")
+                    if collected >= num_transitions:
+                        break
 
             obs_list = env.step(actions)
             done = any(state.get('status') != 'ACTIVE' for state in obs_list)
