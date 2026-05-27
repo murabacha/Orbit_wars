@@ -91,9 +91,13 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
                 planets = p0_obs.get('planets', [])
                 
                 # Build target map following observation tokens sorting sequence
-                # We assume ObservationProcessor follows this order
                 raw_entity_ids = [p[0] for p in planets] + [f[0] for f in p0_obs.get('fleets', [])]
                 raw_entity_ids = raw_entity_ids[:processed['entity_ids'].shape[0]]
+
+                # Aggregators for this step
+                step_targets = np.zeros(max_entities, dtype=np.int64)
+                step_allocs = np.zeros(max_entities, dtype=np.int64)
+                has_valid_move = False
 
                 for m in p0_moves:
                     try:
@@ -101,15 +105,19 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
                     except (ValueError, TypeError):
                         continue
                         
-                    # Find source planet using index 4 for current ship totals (as per prompt)
+                    # Find source planet using index 4 for current ship totals
                     source_planet = next((p for p in planets if p[0] == source_id), None)
                     if source_planet is None:
                         continue
                     
+                    if source_id not in raw_entity_ids:
+                        continue
+                    s_index = raw_entity_ids.index(source_id)
+                    
                     src_x, src_y = source_planet[2], source_planet[3]
-                    src_ships = source_planet[4]  # Verified index position 4 for ships count
+                    src_ships = source_planet[4]
 
-                    # Match heuristic firing angle with wrapper intercept math to identify intended token ID
+                    # Match heuristic firing angle with wrapper intercept math
                     target_id = None
                     best_diff = float('inf')
                     
@@ -117,7 +125,6 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
                         if p[0] == source_id:
                             continue
                         
-                        # Updated Planet structure: [id, owner, x, y, ships, radius, production, ...]
                         p_id, _, px, py, p_ships, p_radius, p_prod, *extra = p
                         p_w = extra[0] if extra else 0.0
                         
@@ -127,35 +134,36 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
                             'source_ships': src_ships, 'angular_velocity': p_w
                         }
 
-                        # Compute what angle the wrapper expects to reach this target
-                        # Pass ships_to_send / src_ships as allocation_percentage
                         alloc_pct = ships_to_send / src_ships if src_ships > 0 else 0
                         solver_angle, _, _, _ = wrapper.get_intercept_params((src_x, src_y), tgt_model, alloc_pct, p0_obs)
                         
-                        # Evaluate angle difference
                         diff = abs(((solver_angle - heuristic_angle + math.pi) % (2 * math.pi)) - math.pi)
                         if diff < best_diff:
                             best_diff = diff
                             target_id = p_id
 
-                    # Only append trajectories where angle match falls within precision tolerances
                     if target_id is None or target_id not in raw_entity_ids:
                         continue
-                    if best_diff > 0.25:  # Tolerance ceiling to catch radical physics exceptions
+                    if best_diff > 0.25:
                         continue
 
                     t_index = raw_entity_ids.index(target_id)
                     alloc_idx = alloc_to_index(ships_to_send, src_ships)
 
+                    step_targets[s_index] = t_index
+                    step_allocs[s_index] = alloc_idx
+                    has_valid_move = True
+
+                if has_valid_move:
                     # Append metrics to data arrays
                     entities_list.append(processed['entities'])
                     entity_ids_list.append(processed['entity_ids'])
                     mask_list.append(processed['mask'])
-                    target_list.append(t_index)
-                    alloc_list.append(alloc_idx)
+                    target_list.append(step_targets)
+                    alloc_list.append(step_allocs)
 
                     collected += 1
-                    if collected % 5000 == 0:
+                    if collected % 1000 == 0:
                         print(f"Collected {collected}/{num_transitions} samples.")
                     if collected >= num_transitions:
                         break
