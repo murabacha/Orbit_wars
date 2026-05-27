@@ -14,9 +14,10 @@ class TestOrbitWarsWrapper(unittest.TestCase):
 
     def test_intercept_static(self):
         # Source (0,0), Target (50,0) static
-        src = Planet(0, 0, 0, 0, 1, 10, 1)
-        tgt = Planet(1, -1, 50, 0, 1, 10, 1)
-        angle, time, tx, ty = self.wrapper.get_intercept_params(src, tgt, 100, 0)
+        tgt_data = {
+            'x': 50, 'y': 0, 'id': 1, 'owner': -1, 'production': 1, 'ships': 10, 'source_ships': 100
+        }
+        angle, time, tx, ty = self.wrapper.get_intercept_params((0, 0), tgt_data, 1.0, {})
         
         self.assertAlmostEqual(angle, 0.0)
         self.assertGreater(time, 0)

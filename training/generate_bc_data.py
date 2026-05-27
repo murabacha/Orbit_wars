@@ -65,8 +65,8 @@ def alloc_to_index(ships_to_send, source_ships):
 
 
 def collect_rollouts(num_transitions, save_path, max_entities=200):
-    obs_proc = ObservationProcessor(max_entities=max_entities)
     wrapper = OrbitWarsWrapper({})
+    obs_proc = ObservationProcessor(wrapper, max_entities=max_entities)
     env = make('orbit_wars', debug=False)
 
     entities_list = []

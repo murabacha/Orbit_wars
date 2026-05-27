@@ -91,7 +91,7 @@ def train(args):
     optimizer = optim.Adam(policy.model.parameters(), lr=config.learning_rate)
 
     wrapper = OrbitWarsWrapper({})
-    obs_proc = ObservationProcessor(max_entities=config.max_entities)
+    obs_proc = ObservationProcessor(wrapper, max_entities=config.max_entities)
     act_proc = ActionProcessor(wrapper)
     reward_shaper = RewardShaper(config.player_id)
 

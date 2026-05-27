@@ -34,7 +34,7 @@ def evaluate_agent(agent_weights: str = None, num_games: int = 100):
     win_count = 0
 
     wrapper = OrbitWarsWrapper({})
-    obs_proc = ObservationProcessor()
+    obs_proc = ObservationProcessor(wrapper)
     act_proc = ActionProcessor(wrapper)
 
     print(f"Evaluating {agent_weights} over {num_games} games...")

@@ -19,7 +19,7 @@ from orbit_wars_ai.agents.transformer_ppo.config import TransformerPPOConfig
 def evaluate_quick(agent_path: str = None, num_games: int = 10, max_steps: int = 500, device: str = 'cpu'):
     env = make('orbit_wars', debug=False)
     wrapper = OrbitWarsWrapper({})
-    obs_proc = ObservationProcessor()
+    obs_proc = ObservationProcessor(wrapper)
     act_proc = ActionProcessor(wrapper)
 
     policy = None
