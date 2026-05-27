@@ -103,16 +103,9 @@ class TransformerPPOModel(nn.Module):
         
         # 6. Apply Hard Structural Penalties via Logit Masking
         if action_masks is not None:
-            # Flatten action_masks to match logits [B, N*N]
-            flat_action_masks = action_masks.view(B, N * N)
-            # Set forbidden target pairs to negative infinity to prevent invalid action evaluation
-            target_logits = target_logits.view(B, N * N).masked_fill(~flat_action_masks, -1e9)
-        else:
-            target_logits = target_logits.view(B, N * N)
+            # Set forbidden target pairs to negative infinity
+            target_logits = target_logits.masked_fill(~action_masks, -1e9)
             
-        # Flatten allocation logits to [B, N*N, 6] to match flattened target indices
-        allocation_logits = allocation_logits.view(B, N * N, 6)
-
         # 7. Compute Global State Estimations via Critic Head
         value = self.critic_head(global_latent) # [B, 1]
         

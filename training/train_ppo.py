@@ -1,11 +1,14 @@
 """
 Production-Grade Proximal Policy Optimization (PPO) Training Loop for Orbit Wars AI.
-Refactored for Scalar N*N Relational Action Space and Predictive PBRS Rewards.
+Fully synchronized with the Relational Source-Target Transformer and Predictive PBRS Wrapper.
+Implements Multi-Dispatch (one dispatch per source planet) to resolve Action Starvation.
 """
 import argparse
 import os
 import sys
 import time
+import math
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -45,45 +48,57 @@ def evaluate_policy_distribution(model: nn.Module, entities: torch.Tensor, entit
                                  mask: torch.Tensor, action_masks: torch.Tensor, 
                                  target_actions: torch.Tensor, alloc_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Computes joint log-probabilities and entropy for flattened scalar actions [B].
+    Computes joint log-probabilities and entropy for multi-dispatch vector actions [N].
     Ensures action masking is applied during the PPO update loop.
     """
-    # Forward pass returns target_logits [B, N*N] and alloc_logits [B, N*N, 6]
+    # Forward pass through Relational Matrix grid layers
     target_logits, alloc_logits, values = model(entities, entity_ids, mask, action_masks)
     
-    # Target distribution over flattened N*N space
+    B, N, _ = entities.shape
+    
+    # Initialize Multi-Discrete categorical distributions
+    # target_logits shape: [B, N, N]
     target_dist = torch.distributions.Categorical(logits=target_logits)
     
-    # Extract allocation logits matching the chosen target trajectory
-    batch_idx = torch.arange(target_actions.shape[0], device=entities.device)
-    selected_alloc_logits = alloc_logits[batch_idx, target_actions, :]
+    # Extract allocation logit slice corresponding to chosen targets
+    # target_actions shape: [B, N]
+    batch_idx = torch.arange(B, device=entities.device).unsqueeze(1).expand(-1, N).reshape(-1)
+    source_idx = torch.arange(N, device=entities.device).unsqueeze(0).expand(B, -1).reshape(-1)
+    chosen_targets = target_actions.view(-1)
+    
+    selected_alloc_logits = alloc_logits[batch_idx, source_idx, chosen_targets, :]
     alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits)
     
-    # Compute log probabilities for the taken actions
-    log_p_targets = target_dist.log_prob(target_actions)
-    log_p_allocs = alloc_dist.log_prob(alloc_actions)
-    joint_log_prob = log_p_targets + log_p_allocs
+    # Calculate log_probs strictly for owned assets
+    # Ownership: channel 2 == 1.0 (Friendly)
+    is_source_owned = (entities[:, :, 2] == 1.0)
+    valid_source_mask = is_source_owned & (mask == 1.0)
     
-    # Entropy calculation for exploration regularization
-    entropy = (target_dist.entropy() + alloc_dist.entropy()).mean()
+    log_p_target = target_dist.log_prob(target_actions) # [B, N]
+    log_p_alloc = alloc_dist.log_prob(alloc_actions.view(-1)).view(B, N)
     
-    return joint_log_prob, entropy, values.squeeze(-1)
+    joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1) # [B]
+    
+    # Entropy calculation weighted by valid assets
+    total_entropy = ((target_dist.entropy() + alloc_dist.entropy().view(B, N)) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
+    
+    return joint_log_prob, total_entropy.mean(), values.squeeze(-1)
 
 
 def ppo_update(model: nn.Module, optimizer: optim.Optimizer, rollout_data: dict, 
                config: dict, epochs: int = 4, batch_size: int = 64):
     """ Executes Trust-Region Clipped Surrogate gradient optimization cycles. """
     obs_batch = rollout_data['obs']
-    action_targets = np.array(rollout_data['targets']) # Shape: [Total_Steps]
-    action_allocs = np.array(rollout_data['allocs'])   # Shape: [Total_Steps]
-    old_log_probs = np.array(rollout_data['log_probs']) # Shape: [Total_Steps]
-    returns = np.array(rollout_data['returns'])         # Shape: [Total_Steps]
-    advantages = np.array(rollout_data['advantages'])   # Shape: [Total_Steps]
+    action_targets = np.stack(rollout_data['targets']) # Shape: [Steps, N]
+    action_allocs = np.stack(rollout_data['allocs'])   # Shape: [Steps, N]
+    old_log_probs = np.array(rollout_data['log_probs'])
+    returns = np.array(rollout_data['returns'])
+    advantages = np.array(rollout_data['advantages'])
     
     dataset_size = len(obs_batch)
     inds = np.arange(dataset_size)
     
-    # Standardize advantages to reduce variance
+    # Standardize advantages
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     
     device = next(model.parameters()).device
@@ -106,7 +121,7 @@ def ppo_update(model: nn.Module, optimizer: optim.Optimizer, rollout_data: dict,
             returns_t = torch.tensor(returns[mb_inds], dtype=torch.float32).to(device)
             advantages_t = torch.tensor(advantages[mb_inds], dtype=torch.float32).to(device)
 
-            # Re-evaluate distribution with masks applied to logits
+            # Re-evaluate distribution with masks applied
             logp, entropy, values = evaluate_policy_distribution(
                 model, entities, entity_ids, mask, act_masks, targets_t, allocs_t
             )
@@ -157,7 +172,7 @@ def train(args):
     act_proc = ActionProcessor(wrapper)
     reward_shaper = RewardShaper(player_id=config["player_id"], gamma=config["gamma"], total_training_steps=args.total_timesteps)
 
-    print(f"Relational PPO Fine-Tuning initiated on: {device}")
+    print(f"Relational Multi-Dispatch PPO initiated on: {device}")
     total_steps = 0
     episode = 0
 
@@ -170,7 +185,7 @@ def train(args):
         obs_list = env.reset()
         
         ep_obs, ep_targets, ep_allocs = [], [], []
-        ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], []
+        ep_logp, ep_values, ep_rewards, ep_dones = [], [], []
 
         done = False
         steps_counter = 0
@@ -185,9 +200,10 @@ def train(args):
             # Action Masking Grid Construction [N, N]
             mask_vector = wrapper.get_action_mask(p0_obs, player_id=config["player_id"], allocation_percentage=1.0)
             action_masks_grid = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool)
-            planets_count = len(p0_obs.get("planets", []))
+            planets_raw = p0_obs.get("planets", [])
+            planets_count = len(planets_raw)
             for s_idx in range(planets_count):
-                if p0_obs["planets"][s_idx][1] == config["player_id"]:
+                if planets_raw[s_idx][1] == config["player_id"]:
                     action_masks_grid[s_idx, :planets_count] = mask_vector
 
             model.eval()
@@ -197,57 +213,51 @@ def train(args):
                 msk_t = torch.tensor(processed['mask'], dtype=torch.float32).unsqueeze(0).to(device)
                 amsk_t = torch.tensor(action_masks_grid, dtype=torch.bool).unsqueeze(0).to(device)
 
-                # target_logits is [1, N*N]
                 target_logits, alloc_logits, value_t = model(ent_t, ids_t, msk_t, amsk_t)
                 
-                target_dist = torch.distributions.Categorical(logits=target_logits.squeeze(0))
-                sampled_target_flat = target_dist.sample() # Scalar index in [0, N*N-1]
+                # Sample targets and allocations for ALL planets
+                target_dist = torch.distributions.Categorical(logits=target_logits)
+                sampled_targets = target_dist.sample() # [1, N]
                 
-                # Allocation slice strictly for chosen flattened target
-                target_idx_val = sampled_target_flat.item()
-                selected_alloc_logits = alloc_logits.squeeze(0)[target_idx_val, :]
+                B, N, _ = ent_t.shape
+                batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N).reshape(-1)
+                source_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).reshape(-1)
+                chosen_targets = sampled_targets.view(-1)
+                
+                selected_alloc_logits = alloc_logits[batch_idx, source_idx, chosen_targets, :]
                 alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits)
-                sampled_alloc = alloc_dist.sample()
+                sampled_allocs = alloc_dist.sample().view(B, N)
                 
-                log_prob = (target_dist.log_prob(sampled_target_flat) + alloc_dist.log_prob(sampled_alloc)).item()
+                # Joint log probability calculation
+                is_source_owned = (processed['entities'][:, 2] == 1.0)
+                valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
+                
+                log_p_target = target_dist.log_prob(sampled_targets)
+                log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
+                
+                joint_log_prob = ((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1).item()
 
-            # Decode flattened index for ActionProcessor
-            N = config["max_entities"]
-            source_idx = target_idx_val // N
-            target_idx = target_idx_val % N
+            # Filter indices for ActionProcessor (strictly for owned planets)
+            owned_indices = np.where(valid_source_mask)[0]
+            learner_target_indices = sampled_targets.squeeze(0).cpu().numpy()[owned_indices].tolist()
+            learner_alloc_indices = sampled_allocs.squeeze(0).cpu().numpy()[owned_indices].tolist()
 
             learner_moves = act_proc.process_actions(
                 p0_obs, player_id=config["player_id"], 
-                target_indices=[target_idx], 
-                allocation_indices=[sampled_alloc.item()]
+                target_indices=learner_target_indices, 
+                allocation_indices=learner_alloc_indices
             )
-            # Override act_proc source logic since we already chose the source
-            # But wait, act_proc iterates through ALL owned planets.
-            # If we sample only one scalar, we should only send from ONE planet.
-            # We need to pass the specific source planet ID.
-            # Refactoring act_proc slightly for scalar dispatch:
-            planets = p0_obs.get("planets", [])
-            src_p = planets[source_idx]
-            tgt_p = planets[target_idx]
             
-            # Simple manual override to ensure scalar dispatch fidelity
-            angle, _, _, _ = wrapper.get_intercept_params((src_p[2], src_p[3]), 
-                                                           {'x': tgt_p[2], 'y': tgt_p[3], 'id': tgt_p[0], 'owner': tgt_p[1], 'production': tgt_p[6], 'ships': tgt_p[4]}, 
-                                                           sampled_alloc.item()/5.0 if sampled_alloc.item() < 5 else 1.0, p0_obs)
-            
-            final_learner_moves = [[src_p[0], angle, int(src_p[4] * (sampled_alloc.item()/5.0 if sampled_alloc.item() < 5 else 0.8))]]
-            if sampled_alloc.item() == 0 or not mask_vector[target_idx]: final_learner_moves = []
-
-            obs_list = env.step([final_learner_moves] + actions)
+            obs_list = env.step([learner_moves] + actions)
             done = any(state.get('status') != 'ACTIVE' for state in obs_list)
             
             reward = reward_shaper.calculate_reward(p0_obs, done, total_steps)
             
             processed['action_masks'] = action_masks_grid
             ep_obs.append(processed)
-            ep_targets.append(target_idx_val)
-            ep_allocs.append(sampled_alloc.item())
-            ep_logp.append(log_prob)
+            ep_targets.append(sampled_targets.squeeze(0).cpu().numpy())
+            ep_allocs.append(sampled_allocs.squeeze(0).cpu().numpy())
+            ep_logp.append(joint_log_prob)
             ep_values.append(value_t.item())
             ep_rewards.append(reward)
             ep_dones.append(done)
@@ -272,6 +282,8 @@ def train(args):
         values_buffer.extend(ep_values)
         rewards_buffer.extend(ep_rewards)
         dones_buffer.extend(ep_dones)
+
+        print(f"Episode {episode} collected {len(ep_rewards)} environment steps, buffer size {len(rewards_buffer)}")
 
         if len(rewards_buffer) >= args.batch_size:
             advantages, returns = compute_gae(np.array(rewards_buffer), np.array(values_buffer), np.array(dones_buffer), config["gamma"], config["gae_lambda"])

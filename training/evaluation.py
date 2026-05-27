@@ -1,6 +1,7 @@
 """
 Robust evaluation suite for benchmarking the Relational Transformer-PPO Agent 
 against fixed heuristic baselines in multi-player configurations.
+Synchronized for Multi-Dispatch (N-vector) relational reasoning.
 """
 import argparse
 import os
@@ -43,57 +44,49 @@ class EvaluationTournament:
         self.model.eval()
 
     def get_agent_actions(self, p_obs: dict, raw_obs: dict, player_id: int) -> list:
-        """ Runs a deterministic argmax inference pass over valid relational pairs. """
-        # Construct turn-by-turn action mask grid matrix
+        """ Runs a deterministic argmax inference pass over valid relational multi-dispatch pairs. """
+        # Construct turn-by-turn action mask grid matrix [N, N]
         mask_vector = self.wrapper.get_action_mask(raw_obs, player_id=player_id, allocation_percentage=1.0)
         action_masks_grid = np.zeros((self.max_entities, self.max_entities), dtype=bool)
         
-        planets_count = len(raw_obs.get("planets", []))
+        planets_raw = raw_obs.get("planets", [])
+        planets_count = len(planets_raw)
         for s_idx in range(planets_count):
-            if raw_obs["planets"][s_idx][1] == player_id:
+            if planets_raw[s_idx][1] == player_id:
                 action_masks_grid[s_idx, :planets_count] = mask_vector
 
-        # Forward pass under inference constraints
+        # Forward pass under deterministic inference constraints
         with torch.no_grad():
             entities_t = torch.tensor(p_obs['entities'], dtype=torch.float32).unsqueeze(0).to(self.device)
             entity_ids_t = torch.tensor(p_obs['entity_ids'], dtype=torch.long).unsqueeze(0).to(self.device)
             mask_t = torch.tensor(p_obs['mask'], dtype=torch.float32).unsqueeze(0).to(self.device)
             act_masks_t = torch.tensor(action_masks_grid, dtype=torch.bool).unsqueeze(0).to(self.device)
 
-            # target_logits is [1, N*N]
+            # target_logits shape: [1, N, N], alloc_logits shape: [1, N, N, 6]
             target_logits, alloc_logits, _ = self.model(entities_t, entity_ids_t, mask_t, act_masks_t)
             
-            # Deterministic selection using argmax
-            target_action_flat = target_logits.squeeze(0).argmax(dim=-1)
-            target_idx_val = target_action_flat.item()
+            # Deterministic argmax across the target dimension for every source node [N]
+            sampled_targets = target_logits.squeeze(0).argmax(dim=-1)
             
-            # Extract matching allocation slice paths
-            selected_alloc_logits = alloc_logits.squeeze(0)[target_idx_val, :]
-            sampled_alloc = selected_alloc_logits.argmax(dim=-1).item()
+            # Deterministic argmax for allocations along the chosen target paths
+            batch_idx = torch.arange(self.max_entities, device=self.device)
+            selected_alloc_logits = alloc_logits.squeeze(0)[batch_idx, sampled_targets, :]
+            sampled_allocs = selected_alloc_logits.argmax(dim=-1)
 
-        # Decode flattened index
-        N = self.max_entities
-        source_idx = target_idx_val // N
-        target_idx = target_idx_val % N
+        # Build owned_indices mask to filter learner moves
+        is_source_owned = (p_obs['entities'][:, 2] == 1.0)
+        valid_source_mask = is_source_owned & (p_obs['mask'] == 1.0)
+        owned_indices = np.where(valid_source_mask)[0]
+        
+        learner_target_indices = sampled_targets.cpu().numpy()[owned_indices].tolist()
+        learner_alloc_indices = sampled_allocs.cpu().numpy()[owned_indices].tolist()
 
         # Translate grid matrices back into continuous Kaggle-compatible vectors
-        # Note: We send from only the selected source planet
-        planets = raw_obs.get("planets", [])
-        if source_idx >= len(planets) or target_idx >= len(planets):
-            return []
-            
-        src_p = planets[source_idx]
-        tgt_p = planets[target_idx]
-        
-        if sampled_alloc == 0:
-            return []
-
-        # Manual construction for deterministic fidelity
-        angle, _, _, _ = self.wrapper.get_intercept_params((src_p[2], src_p[3]), 
-                                                           {'x': tgt_p[2], 'y': tgt_p[3], 'id': tgt_p[0], 'owner': tgt_p[1], 'production': tgt_p[6], 'ships': tgt_p[4]}, 
-                                                           sampled_alloc/5.0 if sampled_alloc < 5 else 1.0, raw_obs)
-        
-        return [[src_p[0], angle, int(src_p[4] * (sampled_alloc/5.0 if sampled_alloc < 5 else 0.8))]]
+        return self.act_proc.process_actions(
+            raw_obs, player_id=player_id,
+            target_indices=learner_target_indices,
+            allocation_indices=learner_alloc_indices
+        )
 
     def run_tournament(self, num_games: int = 20) -> dict:
         """ Runs evaluation matchups while cycling player slot indices to enforce spatial invariance. """
@@ -122,7 +115,7 @@ class EvaluationTournament:
                 for pid in range(4):
                     raw_obs = obs_list[pid]['observation']
                     if pid == my_slot:
-                        # Process candidate model action grid
+                        # Process candidate model action multi-dispatch grid
                         p_obs = self.obs_proc.process(raw_obs, player_id=my_slot)
                         actions[my_slot] = self.get_agent_actions(p_obs, raw_obs, player_id=my_slot)
                     else:
