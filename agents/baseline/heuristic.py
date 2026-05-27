@@ -1,51 +1,38 @@
 import math
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+import time
+from typing import List, Dict, Any
+from .elite_heuristic import agent as elite_agent, build_world
 
 class HeuristicBaseline:
     """
-    An advanced rule-based agent used for Behavioral Cloning and as a training opponent.
-    Prioritizes comets and calculates future garrisons.
+    State-of-the-art rule-based agent (1224 LB points) used for Behavioral Cloning 
+    and as a high-fidelity training opponent.
+    
+    Delegates action selection to the elite_heuristic module which implements:
+    - 8-iteration drift-free intercept physics.
+    - Mission-based tactical orchestration (Snipe, Swarm, Rescue, Reinforce).
+    - Multi-dispatch multi-front deployment.
+    - Slot-invariant spatial reasoning.
     """
     def __init__(self, player_id: int):
         self.player_id = player_id
+        self.step_counter = 0
 
-    def act(self, obs: dict) -> list:
-        moves = []
-        planets = [Planet(*p) for p in obs.get("planets", [])]
-        my_planets = [p for p in planets if p.owner == self.player_id]
-        targets = [p for p in planets if p.owner != self.player_id]
+    def act(self, obs: Dict[str, Any]) -> List[List[Any]]:
+        """
+        Wraps the elite heuristic agent to match the production baseline interface.
+        """
+        # Ensure the observation dictionary has the expected player ID for the elite agent
+        # The elite agent expects obs['player'] to be its own ID.
+        obs_copy = obs.copy()
+        obs_copy['player'] = self.player_id
+        obs_copy['step'] = self.step_counter
         
-        if not my_planets or not targets:
-            return []
-
-        # 1. Prioritize Comets
-        comet_ids = obs.get('comet_planet_ids', [])
-        comet_targets = [p for p in targets if p.id in comet_ids]
+        # Configuration for actTimeout (Standard 1.0s)
+        config = {'actTimeout': 1.0}
         
-        # 2. Simple Expansion Logic
-        for source in my_planets:
-            if source.ships < 5: continue
-            
-            # Find best target (High production / Low cost)
-            best_target = None
-            best_score = -1e9
-            
-            potential_targets = comet_targets if comet_targets else targets
-            
-            for t in potential_targets:
-                dist = math.hypot(source.x - t.x, source.y - t.y)
-                # Heuristic Score: Prod / (Dist * Ships)
-                score = (t.production * 10) / (dist * (t.ships + 1))
-                if score > best_score:
-                    best_score = score
-                    best_target = t
-            
-            if best_target:
-                # Intercept Math (Simplified)
-                angle = math.atan2(best_target.y - source.y, best_target.x - source.x)
-                # Send 70% of ships or enough to cap
-                ships_to_send = min(source.ships - 1, int(best_target.ships * 1.5) + 2)
-                if ships_to_send > 0:
-                    moves.append([source.id, angle, ships_to_send])
-                    
+        # Execute elite decision engine
+        moves = elite_agent(obs_copy, config)
+        
+        self.step_counter += 1
         return moves
