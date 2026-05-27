@@ -2301,7 +2301,7 @@ def build_gang_up_missions(world, policy, planned_commitments, modes):
                 options=[option],
             ))
 
-    return battles
+    return missions
 
 
 def build_elimination_missions(world, policy, planned_commitments, modes):
