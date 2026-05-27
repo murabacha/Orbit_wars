@@ -25,24 +25,30 @@ class TransformerPPOPolicy:
         entities = torch.tensor(obs_tensors['entities']).unsqueeze(0).to(self.device)
         entity_ids = torch.tensor(obs_tensors['entity_ids']).unsqueeze(0).to(self.device)
         mask = torch.tensor(obs_tensors['mask']).unsqueeze(0).to(self.device)
-        
+
+        B, N, _ = entities.shape
+
         with torch.no_grad():
-            target_logits, allocation_logits, value = self.model(entities, entity_ids, mask)
-            
-            # Apply Action Masking to target logits
-            if action_mask is not None:
-                mask_tensor = torch.tensor(action_mask).unsqueeze(0).to(self.device)
-                target_logits = target_logits.masked_fill(~mask_tensor, -1e9)
-            
+            target_logits, allocation_logits, value = self.model(entities, entity_ids, mask, action_masks=action_mask)
+
             target_dist = dist.Categorical(logits=target_logits)
-            allocation_dist = dist.Categorical(logits=allocation_logits)
-            
-            target_action = target_dist.sample()
+            target_action_flat = target_dist.sample() # [1]
+
+            # Decode flattened index to (source, target)
+            target_action_idx = target_action_flat.item()
+            source_idx = target_action_idx // N
+            target_idx = target_action_idx % N
+
+            # Sample allocation strictly for the chosen path
+            # target_logits is [1, N*N], allocation_logits is [1, N*N, 6]
+            selected_alloc_logits = allocation_logits[0, target_action_idx, :]
+            allocation_dist = dist.Categorical(logits=selected_alloc_logits)
             allocation_action = allocation_dist.sample()
-            
-            log_prob = target_dist.log_prob(target_action) + allocation_dist.log_prob(allocation_action)
-            
-        return target_action.item(), allocation_action.item(), log_prob.item(), value.item()
+
+            log_prob = target_dist.log_prob(target_action_flat) + allocation_dist.log_prob(allocation_action)
+
+        return source_idx, target_idx, allocation_action.item(), log_prob.item(), value.item()
+
 
     def evaluate_actions(self, entities, entity_ids, mask, target_actions, allocation_actions):
         """

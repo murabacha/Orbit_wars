@@ -1,228 +1,293 @@
+"""
+Production-Grade Proximal Policy Optimization (PPO) Training Loop for Orbit Wars AI.
+Refactored for Scalar N*N Relational Action Space and Predictive PBRS Rewards.
+"""
 import argparse
 import os
 import sys
 import time
-from collections import deque
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from kaggle_environments import make
+
+# Enforce clean path insertions for local package lookups
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from orbit_wars_ai.environment.wrapper import OrbitWarsWrapper
 from orbit_wars_ai.environment.observation_processor import ObservationProcessor
 from orbit_wars_ai.environment.action_processor import ActionProcessor
 from orbit_wars_ai.environment.rewards import RewardShaper
-from orbit_wars_ai.agents.transformer_ppo.policy import TransformerPPOPolicy
-from orbit_wars_ai.agents.transformer_ppo.config import TransformerPPOConfig
+from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel
 from orbit_wars_ai.agents.baseline.heuristic import HeuristicBaseline
 
 
-def compute_gae(rewards, values, masks, gamma, lam):
+def compute_gae(rewards: np.ndarray, values: np.ndarray, dones: np.ndarray, 
+                gamma: float, lam: float) -> tuple[np.ndarray, np.ndarray]:
+    """ Computes Generalized Advantage Estimations (GAE) with terminal bootstrap handling. """
     advantages = np.zeros_like(rewards)
-    lastgaelam = 0
+    lastgaelam = 0.0
+    
     for t in reversed(range(len(rewards))):
-        nonterminal = 1.0 - masks[t]
+        # nonterminal is 0.0 on the final step of an episode
+        nonterminal = 1.0 - dones[t]
         delta = rewards[t] + gamma * values[t + 1] * nonterminal - values[t]
         lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
         advantages[t] = lastgaelam
+        
     returns = advantages + values[:-1]
     return advantages, returns
 
 
-def ppo_update(policy, optimizer, obs_batch, action_targets, action_allocs, old_log_probs, returns, advantages, clip_range, value_coef, entropy_coef, epochs=4, batch_size=64):
+def evaluate_policy_distribution(model: nn.Module, entities: torch.Tensor, entity_ids: torch.Tensor, 
+                                 mask: torch.Tensor, action_masks: torch.Tensor, 
+                                 target_actions: torch.Tensor, alloc_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Computes joint log-probabilities and entropy for flattened scalar actions [B].
+    Ensures action masking is applied during the PPO update loop.
+    """
+    # Forward pass returns target_logits [B, N*N] and alloc_logits [B, N*N, 6]
+    target_logits, alloc_logits, values = model(entities, entity_ids, mask, action_masks)
+    
+    # Target distribution over flattened N*N space
+    target_dist = torch.distributions.Categorical(logits=target_logits)
+    
+    # Extract allocation logits matching the chosen target trajectory
+    batch_idx = torch.arange(target_actions.shape[0], device=entities.device)
+    selected_alloc_logits = alloc_logits[batch_idx, target_actions, :]
+    alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits)
+    
+    # Compute log probabilities for the taken actions
+    log_p_targets = target_dist.log_prob(target_actions)
+    log_p_allocs = alloc_dist.log_prob(alloc_actions)
+    joint_log_prob = log_p_targets + log_p_allocs
+    
+    # Entropy calculation for exploration regularization
+    entropy = (target_dist.entropy() + alloc_dist.entropy()).mean()
+    
+    return joint_log_prob, entropy, values.squeeze(-1)
+
+
+def ppo_update(model: nn.Module, optimizer: optim.Optimizer, rollout_data: dict, 
+               config: dict, epochs: int = 4, batch_size: int = 64):
+    """ Executes Trust-Region Clipped Surrogate gradient optimization cycles. """
+    obs_batch = rollout_data['obs']
+    action_targets = np.array(rollout_data['targets']) # Shape: [Total_Steps]
+    action_allocs = np.array(rollout_data['allocs'])   # Shape: [Total_Steps]
+    old_log_probs = np.array(rollout_data['log_probs']) # Shape: [Total_Steps]
+    returns = np.array(rollout_data['returns'])         # Shape: [Total_Steps]
+    advantages = np.array(rollout_data['advantages'])   # Shape: [Total_Steps]
+    
     dataset_size = len(obs_batch)
     inds = np.arange(dataset_size)
+    
+    # Standardize advantages to reduce variance
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    
+    device = next(model.parameters()).device
+
     for _ in range(epochs):
         np.random.shuffle(inds)
         for start in range(0, dataset_size, batch_size):
             mb_inds = inds[start:start + batch_size]
+            if len(mb_inds) < batch_size: continue
 
-            # Prepare tensors
-            entities = torch.tensor(np.stack([o['entities'] for o in obs_batch])[mb_inds]).float().to(policy.device)
-            entity_ids = torch.tensor(np.stack([o['entity_ids'] for o in obs_batch])[mb_inds]).long().to(policy.device)
-            mask = torch.tensor(np.stack([o['mask'] for o in obs_batch])[mb_inds]).float().to(policy.device)
+            # Construct dynamic parallel batch tensors
+            entities = torch.tensor(np.stack([o['entities'] for o in obs_batch[mb_inds]]), dtype=torch.float32).to(device)
+            entity_ids = torch.tensor(np.stack([o['entity_ids'] for o in obs_batch[mb_inds]]), dtype=torch.long).to(device)
+            mask = torch.tensor(np.stack([o['mask'] for o in obs_batch[mb_inds]]), dtype=torch.float32).to(device)
+            act_masks = torch.tensor(np.stack([o['action_masks'] for o in obs_batch[mb_inds]]), dtype=torch.bool).to(device)
 
-            target_actions = torch.tensor(action_targets[mb_inds]).to(policy.device)
-            alloc_actions = torch.tensor(action_allocs[mb_inds]).to(policy.device)
-            old_logp = torch.tensor(old_log_probs[mb_inds]).float().to(policy.device)
-            returns_t = torch.tensor(returns[mb_inds]).float().to(policy.device)
-            adv_t = torch.tensor(advantages[mb_inds]).float().to(policy.device)
+            targets_t = torch.tensor(action_targets[mb_inds], dtype=torch.long).to(device)
+            allocs_t = torch.tensor(action_allocs[mb_inds], dtype=torch.long).to(device)
+            old_logp_t = torch.tensor(old_log_probs[mb_inds], dtype=torch.float32).to(device)
+            returns_t = torch.tensor(returns[mb_inds], dtype=torch.float32).to(device)
+            advantages_t = torch.tensor(advantages[mb_inds], dtype=torch.float32).to(device)
 
-            # Forward
-            target_logits, alloc_logits, values = policy.model(entities, entity_ids, mask)
+            # Re-evaluate distribution with masks applied to logits
+            logp, entropy, values = evaluate_policy_distribution(
+                model, entities, entity_ids, mask, act_masks, targets_t, allocs_t
+            )
 
-            # We assume actions correspond to first valid token for simplicity
-            # Convert logits shape: target_logits [batch, seq_len]
-            # Pick the logits at the indices specified by target_actions
-            batch_idx = torch.arange(len(mb_inds)).to(policy.device)
-            chosen_target_logits = target_logits[batch_idx, target_actions[mb_inds]]
-            target_dist = torch.distributions.Categorical(logits=target_logits)
-            alloc_dist = torch.distributions.Categorical(logits=alloc_logits)
-
-            logp = target_dist.log_prob(target_actions[mb_inds]) + alloc_dist.log_prob(alloc_actions[mb_inds])
-            entropy = target_dist.entropy().mean() + alloc_dist.entropy().mean()
-
-            # Policy loss
-            ratio = torch.exp(logp - old_logp[mb_inds])
-            surr1 = ratio * adv_t
-            surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * adv_t
+            # PPO Clipped Objective
+            ratio = torch.exp(logp - old_logp_t)
+            surr1 = ratio * advantages_t
+            surr2 = torch.clamp(ratio, 1.0 - config['clip_range'], 1.0 + config['clip_range']) * advantages_t
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Value loss
-            value_loss = F.mse_loss(values.squeeze(-1), returns_t)
+            # MSE Value Loss
+            value_loss = F.mse_loss(values, returns_t)
 
-            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+            loss = policy_loss + config['value_coef'] * value_loss - config['entropy_coef'] * entropy
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
 
 
 def train(args):
-    config = TransformerPPOConfig()
+    config = {
+        "player_id": 0,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "learning_rate": 2.5e-4,
+        "clip_range": 0.2,
+        "value_coef": 0.5,
+        "entropy_coef": 0.01,
+        "max_entities": 200,
+        "n_epochs": 4
+    }
+    
     device = args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=config["max_entities"])
+    if args.bc_checkpoint and os.path.exists(args.bc_checkpoint):
+        model.load_state_dict(torch.load(args.bc_checkpoint, map_location=device))
+        print(f"Loaded BC checkpoint from: {args.bc_checkpoint}")
+    model.to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-4)
 
-    policy = TransformerPPOPolicy(config, device=device)
-    optimizer = optim.Adam(policy.model.parameters(), lr=config.learning_rate)
-
-    wrapper = OrbitWarsWrapper({})
-    obs_proc = ObservationProcessor(wrapper, max_entities=config.max_entities)
+    wrapper_config = {"shipSpeed": 6.0, "sunRadius": 10.0, "boardSize": 100.0, "episodeSteps": 500}
+    wrapper = OrbitWarsWrapper(wrapper_config)
+    obs_proc = ObservationProcessor(max_entities=config["max_entities"], board_size=wrapper_config["boardSize"], max_speed=wrapper_config["shipSpeed"])
     act_proc = ActionProcessor(wrapper)
-    reward_shaper = RewardShaper(config.player_id)
+    reward_shaper = RewardShaper(player_id=config["player_id"], gamma=config["gamma"], total_training_steps=args.total_timesteps)
 
-    print(f"Starting PPO training on {device}...")
-
+    print(f"Relational PPO Fine-Tuning initiated on: {device}")
     total_steps = 0
     episode = 0
 
-    # Training buffers
-    obs_buffer = []
-    target_actions = []
-    alloc_actions = []
-    log_probs = []
-    values = []
-    rewards = []
-    masks = []
-
-    # Opponent factory
-    def make_baseline(player_id):
-        baseline = HeuristicBaseline(player_id)
-        def agent(obs, config):
-            return baseline.act(obs)
-        return agent
+    obs_buffer, targets_buffer, allocs_buffer = [], [], []
+    log_probs_buffer, values_buffer, rewards_buffer, dones_buffer = [], [], [], []
 
     while total_steps < args.total_timesteps:
         episode += 1
         env = make("orbit_wars", debug=False)
+        obs_list = env.reset()
+        
+        ep_obs, ep_targets, ep_allocs = [], [], []
+        ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], []
 
-        # Per-episode buffers
-        ep_obs = []
-        ep_targets = []
-        ep_allocs = []
-        ep_logp = []
-        ep_values = []
-        ep_rewards = []
-        ep_masks = []
+        done = False
+        steps_counter = 0
+        baselines = [HeuristicBaseline(pid) for pid in range(4)]
 
-        # We'll collect data by registering an agent function that appends to local buffers
-        def learner_agent(obs, config):
-            # obs is the Kaggle observation dict
-            processed = obs_proc.process(obs, config.get('player_id', 0))
-            tgt, alloc, logp, val = policy.get_action(processed, action_mask=None)
+        while not done and steps_counter < 500:
+            actions = [baselines[pid].act(obs_list[pid]['observation']) for pid in range(1, 4)]
 
-            # Store tensors/arrays for training
+            p0_obs = obs_list[0]['observation']
+            processed = obs_proc.process(p0_obs, player_id=config["player_id"])
+            
+            # Action Masking Grid Construction [N, N]
+            mask_vector = wrapper.get_action_mask(p0_obs, player_id=config["player_id"], allocation_percentage=1.0)
+            action_masks_grid = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool)
+            planets_count = len(p0_obs.get("planets", []))
+            for s_idx in range(planets_count):
+                if p0_obs["planets"][s_idx][1] == config["player_id"]:
+                    action_masks_grid[s_idx, :planets_count] = mask_vector
+
+            model.eval()
+            with torch.no_grad():
+                ent_t = torch.tensor(processed['entities'], dtype=torch.float32).unsqueeze(0).to(device)
+                ids_t = torch.tensor(processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device)
+                msk_t = torch.tensor(processed['mask'], dtype=torch.float32).unsqueeze(0).to(device)
+                amsk_t = torch.tensor(action_masks_grid, dtype=torch.bool).unsqueeze(0).to(device)
+
+                # target_logits is [1, N*N]
+                target_logits, alloc_logits, value_t = model(ent_t, ids_t, msk_t, amsk_t)
+                
+                target_dist = torch.distributions.Categorical(logits=target_logits.squeeze(0))
+                sampled_target_flat = target_dist.sample() # Scalar index in [0, N*N-1]
+                
+                # Allocation slice strictly for chosen flattened target
+                target_idx_val = sampled_target_flat.item()
+                selected_alloc_logits = alloc_logits.squeeze(0)[target_idx_val, :]
+                alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits)
+                sampled_alloc = alloc_dist.sample()
+                
+                log_prob = (target_dist.log_prob(sampled_target_flat) + alloc_dist.log_prob(sampled_alloc)).item()
+
+            # Decode flattened index for ActionProcessor
+            N = config["max_entities"]
+            source_idx = target_idx_val // N
+            target_idx = target_idx_val % N
+
+            learner_moves = act_proc.process_actions(
+                p0_obs, player_id=config["player_id"], 
+                target_indices=[target_idx], 
+                allocation_indices=[sampled_alloc.item()]
+            )
+            # Override act_proc source logic since we already chose the source
+            # But wait, act_proc iterates through ALL owned planets.
+            # If we sample only one scalar, we should only send from ONE planet.
+            # We need to pass the specific source planet ID.
+            # Refactoring act_proc slightly for scalar dispatch:
+            planets = p0_obs.get("planets", [])
+            src_p = planets[source_idx]
+            tgt_p = planets[target_idx]
+            
+            # Simple manual override to ensure scalar dispatch fidelity
+            angle, _, _, _ = wrapper.get_intercept_params((src_p[2], src_p[3]), 
+                                                           {'x': tgt_p[2], 'y': tgt_p[3], 'id': tgt_p[0], 'owner': tgt_p[1], 'production': tgt_p[6], 'ships': tgt_p[4]}, 
+                                                           sampled_alloc.item()/5.0 if sampled_alloc.item() < 5 else 1.0, p0_obs)
+            
+            final_learner_moves = [[src_p[0], angle, int(src_p[4] * (sampled_alloc.item()/5.0 if sampled_alloc.item() < 5 else 0.8))]]
+            if sampled_alloc.item() == 0 or not mask_vector[target_idx]: final_learner_moves = []
+
+            obs_list = env.step([final_learner_moves] + actions)
+            done = any(state.get('status') != 'ACTIVE' for state in obs_list)
+            
+            reward = reward_shaper.calculate_reward(p0_obs, done, total_steps)
+            
+            processed['action_masks'] = action_masks_grid
             ep_obs.append(processed)
-            ep_targets.append(tgt)
-            ep_allocs.append(alloc)
-            ep_logp.append(logp)
-            ep_values.append(val)
+            ep_targets.append(target_idx_val)
+            ep_allocs.append(sampled_alloc.item())
+            ep_logp.append(log_prob)
+            ep_values.append(value_t.item())
+            ep_rewards.append(reward)
+            ep_dones.append(done)
 
-            # Return moves
-            moves = act_proc.process_actions(obs, 0, [tgt], [alloc])
-            return moves
+            steps_counter += 1
+            total_steps += 1
 
-        # Build agents list: learner at player 0, heuristics others
-        agents = [learner_agent]
-        for pid in range(1, 4):
-            agents.append(make_baseline(pid))
+        # Bootstrap final value
+        last_obs = obs_list[0]['observation']
+        last_processed = obs_proc.process(last_obs, player_id=config["player_id"])
+        with torch.no_grad():
+            v_ent = torch.tensor(last_processed['entities'], dtype=torch.float32).unsqueeze(0).to(device)
+            v_ids = torch.tensor(last_processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device)
+            v_msk = torch.tensor(last_processed['mask'], dtype=torch.float32).unsqueeze(0).to(device)
+            _, _, last_val = model(v_ent, v_ids, v_msk)
+            ep_values.append(last_val.item())
 
-        # Run one full episode
-        steps = env.run(agents)
-
-        # Kaggle env does not return stepwise rewards directly here; instead we use final rewards
-        # For simplicity, assign zero intermediate rewards and final reward at the end
-        final_rewards = None
-        try:
-            final_steps = env.steps
-            if len(final_steps) > 0:
-                final_rewards = final_steps[-1][0].reward
-        except Exception:
-            final_rewards = None
-
-        T = len(ep_values)
-        for i in range(T):
-            ep_rewards.append(0.0)
-            ep_masks.append(0.0)
-
-        # If final reward exists, add to last step
-        if final_rewards is not None and len(ep_rewards) > 0:
-            try:
-                ep_rewards[-1] += float(final_rewards)
-            except Exception:
-                pass
-
-        # Convert lists to arrays and extend global buffers
         obs_buffer.extend(ep_obs)
-        target_actions.extend(ep_targets)
-        alloc_actions.extend(ep_allocs)
-        log_probs.extend(ep_logp)
-        values.extend(ep_values)
-        rewards.extend(ep_rewards)
-        masks.extend([0.0] * len(ep_rewards))
+        targets_buffer.extend(ep_targets)
+        allocs_buffer.extend(ep_allocs)
+        log_probs_buffer.extend(ep_logp)
+        values_buffer.extend(ep_values)
+        rewards_buffer.extend(ep_rewards)
+        dones_buffer.extend(ep_dones)
 
-        total_steps = len(rewards)
-        print(f"Episode {episode} collected {len(ep_rewards)} steps, total steps {total_steps}")
-
-        # When enough steps collected, perform update
-        if total_steps >= args.batch_size:
-            # Prepare values array with an extra bootstrap value of 0
-            vals = np.array(values + [0.0], dtype=np.float32)
-            rews = np.array(rewards, dtype=np.float32)
-            msks = np.array(masks + [0.0], dtype=np.float32)
-
-            advantages, returns = compute_gae(rews, vals, msks, config.gamma, config.gae_lambda)
-
-            # Convert buffers to numpy arrays for ppo_update
-            ppo_update(policy, optimizer, np.array(obs_buffer), np.array(target_actions), np.array(alloc_actions), np.array(log_probs), returns, advantages, config.clip_range, config.value_coef, config.entropy_coef, epochs=config.n_epochs, batch_size=args.batch_size)
-
-            # Save checkpoint
-            os.makedirs('checkpoints', exist_ok=True)
-            ckpt_path = f'checkpoints/ppo_step_{total_steps}.pt'
-            torch.save(policy.model.state_dict(), ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
-
-            # Clear buffers
-            obs_buffer = []
-            target_actions = []
-            alloc_actions = []
-            log_probs = []
-            values = []
-            rewards = []
-            masks = []
+        if len(rewards_buffer) >= args.batch_size:
+            advantages, returns = compute_gae(np.array(rewards_buffer), np.array(values_buffer), np.array(dones_buffer), config["gamma"], config["gae_lambda"])
+            rollout_data = {'obs': np.array(obs_buffer), 'targets': targets_buffer, 'allocs': allocs_buffer, 'log_probs': log_probs_buffer, 'returns': returns, 'advantages': advantages}
+            model.train()
+            ppo_update(model, optimizer, rollout_data, config, epochs=config["n_epochs"], batch_size=args.batch_size)
+            torch.save(model.state_dict(), f'checkpoints/ppo_step_{total_steps}.pt')
+            obs_buffer, targets_buffer, allocs_buffer, log_probs_buffer, values_buffer, rewards_buffer, dones_buffer = [], [], [], [], [], [], []
 
     print("Training complete")
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--total_timesteps', type=int, default=100000, help='Total environment steps to run')
-    parser.add_argument('--batch_size', type=int, default=2048, help='Batch size / rollout length before update')
+    parser.add_argument('--total_timesteps', type=int, default=1000000)
+    parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--save_interval', type=int, default=50000)
+    parser.add_argument('--bc_checkpoint', type=str, default='checkpoints/bc_pretrained.pt')
     args = parser.parse_args()
     train(args)
