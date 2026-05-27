@@ -23,7 +23,7 @@ class ObservationProcessor:
         #  Lin_Ships, Log_Ships, Norm_Prod, 
         #  Is_Comet, Is_Fleet, VX, VY, 
         #  Hub_Travel_Time, Hub_Arrival_Garrison]
-        self.feature_dim = 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 # Total 19 features
+        self.feature_dim = 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 # Total 18 features
 
     def process(self, obs: Dict[str, Any], player_id: int) -> Dict[str, np.ndarray]:
         entities = []
