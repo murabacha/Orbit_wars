@@ -13,9 +13,11 @@ class ObservationProcessor:
     - True directional flight vectors (vx, vy) for fleets.
     - Predictive features: travel time and arrival garrison from primary hub.
     """
-    def __init__(self, wrapper: OrbitWarsWrapper, max_entities: int = 200):
-        self.wrapper = wrapper
+    def __init__(self, max_entities: int = 200, board_size: float = 100.0, max_speed: float = 6.0):
         self.max_entities = max_entities
+        self.board_size = board_size
+        self.max_speed = max_speed
+        self.wrapper = OrbitWarsWrapper({"shipSpeed": max_speed, "boardSize": board_size})
         # Feature mapping:
         # [Norm_ID, Owner_OH(5), Norm_X, Norm_Y, Norm_R, 
         #  Lin_Ships, Log_Ships, Norm_Prod, 
@@ -35,13 +37,16 @@ class ObservationProcessor:
         hub = None
         max_prod = -1
         for p_data in planets_raw:
+            # Updated structure: [id, owner, x, y, ships, radius, production, ...]
             if p_data[1] == player_id and p_data[6] > max_prod:
                 max_prod = p_data[6]
-                hub = Planet(*p_data)
+                # Map to standard Planet object for consistency if needed, 
+                # but ensure we use the correct index for ships/radius
+                hub = Planet(p_data[0], p_data[1], p_data[2], p_data[3], p_data[5], p_data[4], p_data[6])
         
         # 2. Process Planets
         for p_data in planets_raw:
-            p_obj = Planet(*p_data)
+            p_obj = Planet(p_data[0], p_data[1], p_data[2], p_data[3], p_data[5], p_data[4], p_data[6])
             feat = self._create_planet_features(p_obj, hub, obs, comet_ids)
             entities.append(feat)
             entity_ids.append(p_obj.id)
@@ -82,16 +87,21 @@ class ObservationProcessor:
         hub_travel_time = 0.0
         hub_arrival_garrison = lin_ships
         if hub and hub.id != planet.id:
-            _, hub_travel_time, _, _ = self.wrapper.get_intercept_params(hub, planet, 1.0, obs)
-            raw_garrison = self.wrapper.estimate_future_garrison(planet, hub_travel_time)
+            planet_data = {
+                'x': planet.x, 'y': planet.y, 'id': planet.id, 
+                'owner': planet.owner, 'production': planet.production, 
+                'ships': planet.ships, 'source_ships': hub.ships
+            }
+            _, hub_travel_time, _, _ = self.wrapper.get_intercept_params((hub.x, hub.y), planet_data, 1.0, obs)
+            raw_garrison = self.wrapper.estimate_future_garrison(planet_data, hub_travel_time)
             hub_arrival_garrison = raw_garrison / 1000.0
             hub_travel_time /= 100.0 # Normalize turns
             
         return [
             planet.id / 500.0,
             *owner_oh,
-            planet.x / 100.0,
-            planet.y / 100.0,
+            planet.x / self.board_size,
+            planet.y / self.board_size,
             planet.radius / 10.0,
             lin_ships,
             log_ships,
@@ -116,8 +126,8 @@ class ObservationProcessor:
         # Velocity Vectors
         # In Orbit Wars, fleet.angle is raw continuous angle. Speed is dynamic.
         speed = self.wrapper.calculate_speed(fleet.ships)
-        vx = math.cos(fleet.angle) * speed / 6.0 # Norm by max_speed
-        vy = math.sin(fleet.angle) * speed / 6.0
+        vx = math.cos(fleet.angle) * speed / self.max_speed
+        vy = math.sin(fleet.angle) * speed / self.max_speed
         
         # Predictive Features from Hub (Travel time to moving fleet)
         hub_travel_time = 0.0
@@ -130,8 +140,8 @@ class ObservationProcessor:
         return [
             fleet.id / 500.0,
             *owner_oh,
-            fleet.x / 100.0,
-            fleet.y / 100.0,
+            fleet.x / self.board_size,
+            fleet.y / self.board_size,
             0.05, # Fixed Norm_R for fleets
             lin_ships,
             log_ships,
