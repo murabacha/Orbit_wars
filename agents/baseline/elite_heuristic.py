@@ -3254,19 +3254,15 @@ def plan_moves(world, deadline=None):
 # Agent Entry Point
 # ============================================================
 
-_agent_step = 0
-
-
 def _read(obs, key, default=None):
     if isinstance(obs, dict):
         return obs.get(key, default)
     return getattr(obs, key, default)
 
 
-def build_world(obs, inferred_step=None):
+def build_world(obs):
     player = _read(obs, "player", 0)
-    obs_step = _read(obs, "step", 0) or 0
-    step = max(obs_step, inferred_step or 0)
+    step = _read(obs, "step", 0) or 0
     raw_planets = _read(obs, "planets", []) or []
     raw_fleets = _read(obs, "fleets", []) or []
     ang_vel = _read(obs, "angular_velocity", 0.0) or 0.0
@@ -3292,10 +3288,8 @@ def build_world(obs, inferred_step=None):
 
 
 def agent(obs, config=None):
-    global _agent_step
-    _agent_step += 1
     start_time = time.perf_counter()
-    world = build_world(obs, inferred_step=_agent_step - 1)
+    world = build_world(obs)
     if not world.my_planets:
         return []
     act_timeout = _read(config, "actTimeout", 1.0) if config is not None else 1.0

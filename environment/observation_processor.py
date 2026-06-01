@@ -71,7 +71,7 @@ class ObservationProcessor:
         return {
             "entities": np.array(entities, dtype=np.float32),
             "entity_ids": np.array(entity_ids, dtype=np.int64),
-            "mask": np.array([1] * num_entities + [0] * (self.max_entities - num_entities), dtype=np.float32)
+            "mask": np.array([1.0] * min(num_entities, self.max_entities) + [0.0] * max(0, self.max_entities - num_entities), dtype=np.float32)
         }
 
     def _create_planet_features(self, planet: Planet, hub: Planet, obs: Dict[str, Any], comet_ids: List[int]) -> List[float]:

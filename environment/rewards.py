@@ -17,6 +17,7 @@ class RewardShaper:
         # State tracking flags for potential evaluations
         self.is_initialized = False
         self.prev_potential = 0.0
+        self.last_dense_weight = 1.0
 
     def compute_potential(self, obs: Dict[str, Any], dense_weight: float) -> float:
         """
@@ -68,6 +69,7 @@ class RewardShaper:
         """
         # Calculate active curriculum weight (annealing linearly from 1.0 to 0.0)
         dense_weight = max(0.0, 1.0 - (current_global_step / self.total_training_steps))
+        self.last_dense_weight = dense_weight
         
         # 1. Compute State Potential
         current_potential = self.compute_potential(obs, dense_weight)
