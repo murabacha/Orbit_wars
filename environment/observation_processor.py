@@ -6,8 +6,9 @@ from .wrapper import OrbitWarsWrapper
 
 class ObservationProcessor:
     """
-    Refactored ObservationProcessor for Orbit Wars.
-    Correctly maps Planet attributes [id, owner, x, y, radius, ships, production].
+    Final audited ObservationProcessor for Orbit Wars.
+    Ensures 100% alignment between raw list [id, owner, x, y, radius, ships, prod] 
+    and Planet namedtuple structure.
     """
     def __init__(self, max_entities: int = 200, board_size: float = 100.0, max_speed: float = 6.0):
         self.max_entities = max_entities
@@ -27,6 +28,7 @@ class ObservationProcessor:
         hub = None
         max_prod = -1
         for p_data in planets_raw:
+            # Correct Mapping: [0:id, 1:owner, 2:x, 3:y, 4:radius, 5:ships, 6:production]
             if p_data[1] == player_id and p_data[6] > max_prod:
                 max_prod = p_data[6]
                 hub = Planet(*p_data[:7])

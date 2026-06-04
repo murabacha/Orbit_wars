@@ -3,7 +3,7 @@ from dataclasses import dataclass
 @dataclass
 class TransformerPPOConfig:
     # Architecture
-    feature_dim: int = 13
+    feature_dim: int = 18
     embed_dim: int = 128
     num_heads: int = 4
     num_layers: int = 3
