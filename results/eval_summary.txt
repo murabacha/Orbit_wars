@@ -1,3 +1,5 @@
 agent=checkpoints/bc_test.pt num_games=10 max_steps=500 win_rate=0.3
 agent=checkpoints/bc_test.pt num_games=50 max_steps=500 win_rate=0.62
 self_play agent=checkpoints/bc_test.pt num_games=20 win_rate=0.0
+agent=checkpoints/bc_pretrained.pt num_games=1 max_steps=50 win_rate=0.0
+agent=checkpoints/bc_pretrained.pt num_games=5 max_steps=500 win_rate=0.0

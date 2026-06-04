@@ -70,6 +70,8 @@ def evaluate_quick(agent_path: str = None, num_games: int = 10, max_steps: int =
             reward = 0
         if reward is not None and reward > 0:
             win_count += 1
+        
+        print(f"Game {g+1}/{num_games} finished. Steps: {steps}, Result: {'Win' if reward > 0 else 'Loss'}")
 
     win_rate = win_count / num_games
     print(f"Quick win rate: {win_rate*100:.2f}% ({win_count}/{num_games})")

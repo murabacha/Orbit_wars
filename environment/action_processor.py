@@ -24,7 +24,10 @@ class ActionProcessor:
             for p_id in group['planet_ids']:
                 comet_map[p_id] = group
 
-        for i, source in enumerate(my_planets):
+        for i, source in enumerate(planets):
+            if source.owner != player_id:
+                continue
+            
             if i >= len(target_indices): break
             
             target_idx = target_indices[i]
