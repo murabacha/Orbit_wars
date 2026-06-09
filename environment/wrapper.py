@@ -87,9 +87,12 @@ class OrbitWarsWrapper:
         for s_idx, source in enumerate(planets):
             if source.owner != player_id or source.ships < 1:
                 continue
+            
+            # FIX: Always allow self-targeting as a "do-nothing" action to prevent uniform trap
+            mask[s_idx, s_idx] = True
                 
             for t_idx, target in enumerate(planets):
-                if target.owner == player_id:
+                if t_idx == s_idx:
                     continue
                 
                 target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}

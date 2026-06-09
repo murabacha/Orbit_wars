@@ -37,7 +37,9 @@ class RewardShaper:
         # (Based on probing, ships is index 5, production is index 6)
         # FIX: Index 5 is ships, Index 4 is radius. 
         ships_on_planets = sum(p[5] for p in my_planets)
-        ships_in_fleets = sum(f[6] for f in my_fleets)
+        
+        # FIX: Index 4 is ships in standard Kaggle Fleet tuple
+        ships_in_fleets = sum(f[4] for f in my_fleets)
         total_ships = ships_on_planets + ships_in_fleets
         
         total_production = sum(p[6] for p in my_planets)

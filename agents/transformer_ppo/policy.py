@@ -55,7 +55,9 @@ class TransformerPPOPolicy:
             log_p_target = target_dist.log_prob(target_actions) # [1, N]
             log_p_alloc = allocation_dist.log_prob(allocation_actions.view(-1)).view(B, N)
 
-            joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1)
+            # FIX: Stabilize joint log prob by averaging over active entities
+            valid_counts = torch.clamp(valid_source_mask.float().sum(dim=-1), min=1.0)
+            joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1) / valid_counts
 
         return target_actions.squeeze(0).cpu().numpy(), allocation_actions.squeeze(0).cpu().numpy(), joint_log_prob.item(), value.item()
 
@@ -80,10 +82,12 @@ class TransformerPPOPolicy:
         valid_source_mask = is_source_owned & (mask == 1.0)
 
         log_p_target = target_dist.log_prob(target_actions)
-        log_p_alloc = allocation_dist.log_prob(allocation_actions.view(-1)).view(B, N)
+        log_p_alloc = alloc_dist.log_prob(allocation_actions.view(-1)).view(B, N)
 
-        joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1)
+        # FIX: Stabilize joint log prob by averaging over active entities
+        valid_counts = torch.clamp(valid_source_mask.float().sum(dim=-1), min=1.0)
+        joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1) / valid_counts
+        
         entropy = ((target_dist.entropy() + allocation_dist.entropy().view(B, N)) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
 
         return joint_log_prob, values.squeeze(-1), entropy.mean()
-
