@@ -68,8 +68,8 @@ class ObservationProcessor:
         hub_travel_time = 0.0
         hub_arrival_garrison = lin_ships
         if hub and hub.id != planet.id:
-            planet_data = {'x': planet.x, 'y': planet.y, 'id': planet.id, 'owner': planet.owner, 'production': planet.production, 'ships': planet.ships, 'source_ships': hub.ships}
-            _, hub_travel_time, _, _ = self.wrapper.get_intercept_params((hub.x, hub.y), planet_data, 1.0, obs)
+            planet_data = {'x': planet.x, 'y': planet.y, 'radius': planet.radius, 'id': planet.id, 'owner': planet.owner, 'production': planet.production, 'ships': planet.ships, 'source_ships': hub.ships}
+            _, hub_travel_time, _, _ = self.wrapper.get_intercept_params((hub.x, hub.y), hub.radius, planet_data, 1.0, obs)
             raw_garrison = self.wrapper.estimate_future_garrison(planet_data, hub_travel_time)
             hub_arrival_garrison = raw_garrison / 1000.0
             hub_travel_time /= 100.0

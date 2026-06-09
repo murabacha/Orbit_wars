@@ -2,3 +2,5 @@
 # Ignore data folder
 data/
 checkpoints/
+# iwashere personal notes
+.iwashere/

@@ -64,17 +64,12 @@ class EvaluationTournament:
             selected_alloc_logits = alloc_logits.squeeze(0)[batch_idx, sampled_targets, :]
             sampled_allocs = selected_alloc_logits.argmax(dim=-1)
 
-        # FIX: Dynamically find the "Owner One-Hot" index for the current seat.
-        # Feature Mapping: 0: Norm_ID, 1: Owner_-1, 2: Owner_0, 3: Owner_1, 4: Owner_2, 5: Owner_3
-        owner_feat_idx = player_id + 2
-        is_source_owned = (p_obs['entities'][:, owner_feat_idx] == 1.0)
-        valid_source_mask = is_source_owned & (p_obs['mask'] == 1.0)
-        owned_indices = np.where(valid_source_mask)[0]
-        
+        # PASS FULL LISTS: ActionProcessor now uses the planet's actual index (i) 
+        # to look up target/alloc, so we MUST provide the full mapping.
         return self.act_proc.process_actions(
             raw_obs, player_id=player_id,
-            target_indices=sampled_targets.cpu().numpy()[owned_indices].tolist(),
-            allocation_indices=sampled_allocs.cpu().numpy()[owned_indices].tolist()
+            target_indices=sampled_targets.cpu().numpy().tolist(),
+            allocation_indices=sampled_allocs.cpu().numpy().tolist()
         )
 
     def run_tournament(self, num_games: int = 20) -> dict:

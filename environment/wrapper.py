@@ -20,15 +20,18 @@ class OrbitWarsWrapper:
         speed = 1.0 + (self.max_speed - 1.0) * (log_ratio ** 1.5)
         return min(speed, self.max_speed)
 
-    def get_intercept_params(self, source_pos: Tuple[float, float], target_data: Dict[str, Any], allocation_percentage: float, obs: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    def get_intercept_params(self, source_pos: Tuple[float, float], source_radius: float, target_data: Dict[str, Any], allocation_percentage: float, obs: Dict[str, Any]) -> Tuple[float, float, float, float]:
         source_x, source_y = source_pos
         source_ships = target_data.get('source_ships', 100)
+        target_radius = target_data.get('radius', 0.0)
         ships_sent = int(source_ships * allocation_percentage)
         speed = self.calculate_speed(ships_sent)
         tx, ty = target_data['x'], target_data['y']
         travel_time = 0.0
         for _ in range(8):
-            dist = math.hypot(tx - source_x, ty - source_y)
+            # FIX: Surface-to-Surface distance (matches elite_heuristic launch physics)
+            raw_dist = math.hypot(tx - source_x, ty - source_y)
+            dist = max(0.0, raw_dist - source_radius - target_radius - 0.1)
             travel_time = dist / speed
             tx, ty = self.predict_future_position(target_data, travel_time, obs)
         angle = math.atan2(ty - source_y, tx - source_x)
@@ -43,13 +46,19 @@ class OrbitWarsWrapper:
                 curr_idx = group['path_index']
                 future_idx = min(len(path) - 1, int(curr_idx + travel_time))
                 return path[future_idx][0], path[future_idx][1]
-        dx, dy = target_data['x'] - CENTER, target_data['y'] - CENTER
+        
+        # Use board_size instead of imported CENTER to prevent tuple TypeError
+        center = self.board_size / 2.0 
+        dx, dy = target_data['x'] - center, target_data['y'] - center
         rad = math.hypot(dx, dy)
-        if rad < 45.0:
+        target_radius = target_data.get('radius', 0.0)
+        
+        # FIX: Align orbit check with elite_heuristic's ROTATION_LIMIT
+        if rad + target_radius < 50.0:
             angular_velocity = obs.get('planet_angular_velocities', {}).get(target_id, target_data.get('angular_velocity', 0.02))
             initial_angle = math.atan2(dy, dx)
             future_angle = initial_angle + (angular_velocity * travel_time)
-            return CENTER + rad * math.cos(future_angle), CENTER + rad * math.sin(future_angle)
+            return center + rad * math.cos(future_angle), center + rad * math.sin(future_angle)
         return target_data['x'], target_data['y']
 
     def estimate_future_garrison(self, target_data: Dict[str, Any], travel_time: float) -> int:
@@ -74,12 +83,12 @@ class OrbitWarsWrapper:
             if target.owner == player_id:
                 mask[i] = False
                 continue
-            target_data = {'x': target.x, 'y': target.y, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships}
+            target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships}
             safe_path_exists = False
             for source in my_planets:
                 if source.ships < 1: continue
                 target_data['source_ships'] = source.ships
-                angle, travel_time, tx, ty = self.get_intercept_params((source.x, source.y), target_data, allocation_percentage, obs)
+                angle, travel_time, tx, ty = self.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_percentage, obs)
                 if target.id in comet_ids:
                     invalid_arrival = False
                     for group in obs.get('comets', []):

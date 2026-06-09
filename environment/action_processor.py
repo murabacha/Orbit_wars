@@ -37,14 +37,14 @@ class ActionProcessor:
                 continue
             
             target = planets[target_idx]
-            target_data = {'x': target.x, 'y': target.y, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}
+            target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}
             
             if alloc_idx == 5:
                 num_ships = target.ships + 5
                 allocation_pct = 1.0
                 for _ in range(5):
                     allocation_pct = min(1.0, num_ships / source.ships) if source.ships > 0 else 0
-                    _, travel_time, _, _ = self.wrapper.get_intercept_params((source.x, source.y), target_data, allocation_pct, obs)
+                    _, travel_time, _, _ = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
                     future_garrison = self.wrapper.estimate_future_garrison(target_data, travel_time)
                     new_num_ships = min(source.ships, future_garrison + 5)
                     if abs(new_num_ships - num_ships) < 1: break
@@ -56,7 +56,7 @@ class ActionProcessor:
 
             if num_ships <= 0: continue
             
-            angle, travel_time, tx, ty = self.wrapper.get_intercept_params((source.x, source.y), target_data, allocation_pct, obs)
+            angle, travel_time, tx, ty = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
             dist_to_intercept = math.hypot(tx - source.x, ty - source.y)
             if self.wrapper.is_path_safe(source.x, source.y, angle, dist_to_intercept):
                 all_moves.append([source.id, angle, num_ships])

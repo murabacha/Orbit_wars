@@ -42,14 +42,16 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
             print(f"✅ Successfully resumed from {collected}/{num_transitions}")
         except: print("⚠️ Starting fresh.")
 
+    env = make('orbit_wars', debug=False)
     episode = 0
     while collected < num_transitions:
         episode += 1
-        env = make('orbit_wars', configuration={'seed': random.randint(0, 1000000)}, debug=False)
-        obs_list = env.reset(); num_players = len(obs_list)
+        obs_list = env.reset()
+        num_players = len(obs_list)
         baselines = [HeuristicBaseline(pid) for pid in range(num_players)]
         obs_procs = [ObservationProcessor(max_entities=max_entities, board_size=100.0, max_speed=6.0) for _ in range(num_players)]
         done, steps = False, 0
+        ep_matched = 0
         while not done and collected < num_transitions and steps < 500:
             actions = [baselines[pid].act(obs_list[pid]['observation']) if obs_list[pid]['status'] == 'ACTIVE' else [] for pid in range(num_players)]
             for pid in range(num_players):
@@ -66,24 +68,27 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
                         source_planet = next((p for p in planets if p[0] == source_id), None)
                         if source_planet is None or source_id not in raw_entity_ids: continue
                         s_index = raw_entity_ids.index(source_id)
-                        # Correct index: [2]=x, [3]=y, [5]=ships
-                        src_x, src_y, src_ships = source_planet[2], source_planet[3], source_planet[5]
+                        # Correct index: [2]=x, [3]=y, [4]=radius, [5]=ships
+                        src_x, src_y, src_rad, src_ships = source_planet[2], source_planet[3], source_planet[4], source_planet[5]
                         target_id, best_diff = None, float('inf')
                         for p in planets:
                             if p[0] == source_id: continue
                             # Planet list: [0:id, 1:owner, 2:x, 3:y, 4:radius, 5:ships, 6:prod]
                             p_id, p_owner, px, py, p_rad, p_ships, p_prod = p[:7]
-                            tgt_model = {'x': px, 'y': py, 'id': p_id, 'owner': p_owner, 'production': p_prod, 'ships': p_ships, 'source_ships': src_ships}
-                            solver_angle, _, _, _ = wrapper.get_intercept_params((src_x, src_y), tgt_model, ships_to_send/src_ships if src_ships > 0 else 0, player_obs)
+                            tgt_model = {'x': px, 'y': py, 'radius': p_rad, 'id': p_id, 'owner': p_owner, 'production': p_prod, 'ships': p_ships, 'source_ships': src_ships}
+                            solver_angle, _, _, _ = wrapper.get_intercept_params((src_x, src_y), src_rad, tgt_model, ships_to_send/src_ships if src_ships > 0 else 0, player_obs)
                             diff = abs(((solver_angle - heuristic_angle + math.pi) % (2 * math.pi)) - math.pi)
                             if diff < best_diff: best_diff, target_id = diff, p_id
                         if target_id is not None and target_id in raw_entity_ids and best_diff <= 0.25:
                             step_targets[s_index], step_allocs[s_index], has_valid_move = raw_entity_ids.index(target_id), alloc_to_index(ships_to_send, src_ships), True
                     if has_valid_move:
                         entities_list.append(processed['entities']); entity_ids_list.append(processed['entity_ids']); mask_list.append(processed['mask']); target_list.append(step_targets); alloc_list.append(step_allocs); collected += 1
+                        ep_matched += 1
+                        if collected % 100 == 0: print(f"Collected {collected}/{num_transitions}...")
                         if collected % checkpoint_interval == 0: save_dataset(save_path, entities_list, entity_ids_list, mask_list, target_list, alloc_list)
                         if collected >= num_transitions: break
             obs_list = env.step(actions); done = all(s.get('status') != 'ACTIVE' for s in obs_list); steps += 1
+        print(f"Episode {episode} finished. Matched: {ep_matched} transitions. Total: {collected}")
     save_dataset(save_path, entities_list, entity_ids_list, mask_list, target_list, alloc_list)
     print(f"Finalized dataset: {collected} rows.")
 
