@@ -66,29 +66,36 @@ class OrbitWarsWrapper:
         return target_data['ships'] + int(target_data['production'] * travel_time)
 
     def is_path_safe(self, source_x: float, source_y: float, angle: float, dist: float) -> bool:
-        dx, dy = CENTER - source_x, CENTER - source_y
+        # FIX: Define center as a float to prevent tuple TypeErrors
+        center_val = self.board_size / 2.0 
+        
+        dx, dy = center_val - source_x, center_val - source_y
         vx, vy = math.cos(angle), math.sin(angle)
         t = max(0.0, min(dist, dx * vx + dy * vy))
         closest_x, closest_y = source_x + t * vx, source_y + t * vy
-        return math.hypot(closest_x - CENTER, closest_y - CENTER) > self.sun_radius
+        
+        return math.hypot(closest_x - center_val, closest_y - center_val) > self.sun_radius
 
     def get_action_mask(self, obs: Dict[str, Any], player_id: int, allocation_percentage: float = 1.0) -> np.ndarray:
         planets_raw = obs.get("planets", [])
-        mask = np.ones(len(planets_raw), dtype=bool)
+        num_planets = len(planets_raw)
+        # FIX: Return 2D mask (source, target) for pairwise path validation
+        mask = np.zeros((num_planets, num_planets), dtype=bool)
         planets = [Planet(*p[:7]) for p in planets_raw]
-        my_planets = [p for p in planets if p.owner == player_id]
-        if not my_planets: return np.zeros(len(planets), dtype=bool)
         comet_ids = obs.get('comet_planet_ids', [])
-        for i, target in enumerate(planets):
-            if target.owner == player_id:
-                mask[i] = False
+        
+        for s_idx, source in enumerate(planets):
+            if source.owner != player_id or source.ships < 1:
                 continue
-            target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships}
-            safe_path_exists = False
-            for source in my_planets:
-                if source.ships < 1: continue
-                target_data['source_ships'] = source.ships
+                
+            for t_idx, target in enumerate(planets):
+                if target.owner == player_id:
+                    continue
+                
+                target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}
+                
                 angle, travel_time, tx, ty = self.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_percentage, obs)
+                
                 if target.id in comet_ids:
                     invalid_arrival = False
                     for group in obs.get('comets', []):
@@ -97,8 +104,7 @@ class OrbitWarsWrapper:
                                 invalid_arrival = True
                                 break
                     if invalid_arrival: continue
+                
                 if self.is_path_safe(source.x, source.y, angle, math.hypot(tx - source.x, ty - source.y)):
-                    safe_path_exists = True
-                    break
-            mask[i] = safe_path_exists
+                    mask[s_idx, t_idx] = True
         return mask

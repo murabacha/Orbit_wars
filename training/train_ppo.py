@@ -46,7 +46,8 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     valid_source_mask = is_source_owned & (mask == 1.0)
     log_p_target = target_dist.log_prob(target_actions)
     log_p_alloc = alloc_dist.log_prob(alloc_actions.view(-1)).view(B, N)
-    joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1)
+    # FIX: Use mean over active entities to stabilize gradients and prevent ratio explosion
+    joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
     total_entropy = ((target_dist.entropy() + alloc_dist.entropy().view(B, N)) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
     return joint_log_prob, total_entropy.mean(), values.squeeze(-1)
 
@@ -150,12 +151,12 @@ def train(args):
                 else: actions.append([])
             p0_obs = obs_list[0]['observation']
             processed = obs_proc.process(p0_obs, player_id=config["player_id"])
-            mask_vector = wrapper.get_action_mask(p0_obs, player_id=config["player_id"], allocation_percentage=1.0)
+            
+            # FIX: Use 2D pairwise mask directly
+            full_mask = wrapper.get_action_mask(p0_obs, player_id=config["player_id"])
             action_masks_grid = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool)
-            planets_raw = p0_obs.get("planets", [])
-            for s_idx in range(len(planets_raw)):
-                if planets_raw[s_idx][1] == config["player_id"]:
-                    action_masks_grid[s_idx, :len(planets_raw)] = mask_vector
+            action_masks_grid[:full_mask.shape[0], :full_mask.shape[1]] = full_mask
+
             model.eval()
             with torch.no_grad():
                 with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
@@ -171,7 +172,9 @@ def train(args):
                     alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits); sampled_allocs = alloc_dist.sample().view(B, N)
                     is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
                     log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
-                    joint_log_prob = ((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1).item()
+                    # FIX: Use mean over active entities to stabilize gradients
+                    valid_counts = torch.clamp(torch.tensor(valid_source_mask, device=device).float().sum(dim=-1), min=1.0)
+                    joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1) / valid_counts).item()
             # FIX: Pass the full unmasked arrays. ActionProcessor uses absolute indices.
             learner_moves = act_proc.process_actions(
                 p0_obs, 
@@ -186,7 +189,9 @@ def train(args):
         last_obs = obs_list[0]['observation']; last_processed = obs_proc.process(last_obs, player_id=config["player_id"])
         with torch.no_grad():
             with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
-                v_ent = torch.tensor(last_processed['entities'], dtype=torch.float32).unsqueeze(0).to(device); v_ids = torch.tensor(last_processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device); v_msk = torch.tensor(last_processed['mask'], dtype=torch.float32).unsqueeze(0).to(device); _, _, last_val = model(v_ent, v_ids, v_msk); bootstrap_val = last_val.item()
+                v_ent = torch.tensor(last_processed['entities'], dtype=torch.float32).unsqueeze(0).to(device); v_ids = torch.tensor(last_processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device); v_msk = torch.tensor(last_processed['mask'], dtype=torch.float32).unsqueeze(0).to(device); _, _, last_val = model(v_ent, v_ids, v_msk)
+                # FIX: Bootstrap value is 0.0 if episode ended naturally, else use network value
+                bootstrap_val = 0.0 if done else last_val.item()
         ep_adv, ep_ret = compute_gae(np.array(ep_rewards), np.array(ep_values), np.array(ep_dones), config["gamma"], config["gae_lambda"], bootstrap_val)
         obs_buffer.extend(ep_obs); targets_buffer.extend(ep_targets); allocs_buffer.extend(ep_allocs); log_probs_buffer.extend(ep_logp); advantages_buffer.extend(ep_adv); returns_buffer.extend(ep_ret)
         print(f"E{episode} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")

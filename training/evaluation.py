@@ -42,14 +42,10 @@ class EvaluationTournament:
         self.model.eval()
 
     def get_agent_actions(self, p_obs: dict, raw_obs: dict, player_id: int) -> list:
-        mask_vector = self.wrapper.get_action_mask(raw_obs, player_id=player_id, allocation_percentage=1.0)
+        # FIX: Use 2D pairwise mask directly from wrapper
+        full_mask = self.wrapper.get_action_mask(raw_obs, player_id=player_id)
         action_masks_grid = np.zeros((self.max_entities, self.max_entities), dtype=bool)
-        
-        planets_raw = raw_obs.get("planets", [])
-        planets_count = len(planets_raw)
-        for s_idx in range(planets_count):
-            if planets_raw[s_idx][1] == player_id:
-                action_masks_grid[s_idx, :planets_count] = mask_vector
+        action_masks_grid[:full_mask.shape[0], :full_mask.shape[1]] = full_mask
 
         with torch.no_grad():
             ent_t = torch.tensor(p_obs['entities'], dtype=torch.float32).unsqueeze(0).to(self.device)
