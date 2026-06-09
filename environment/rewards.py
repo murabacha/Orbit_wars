@@ -35,9 +35,8 @@ class RewardShaper:
         # Extraction metrics based on updated planet list index positions
         # Planet structure: [id, owner, x, y, radius, ships, production]
         # (Based on probing, ships is index 5, production is index 6)
-        # Note: If the user explicitly provided a structure with ships at 4, we follow that.
-        # User provided: [id, owner, x, y, ships, radius, production, angular_velocity]
-        ships_on_planets = sum(p[4] for p in my_planets)
+        # FIX: Index 5 is ships, Index 4 is radius. 
+        ships_on_planets = sum(p[5] for p in my_planets)
         ships_in_fleets = sum(f[6] for f in my_fleets)
         total_ships = ships_on_planets + ships_in_fleets
         
@@ -74,6 +73,10 @@ class RewardShaper:
         # 1. Compute State Potential
         current_potential = self.compute_potential(obs, dense_weight)
         
+        # FIX: If the episode is over, there is no future state. Potential must be 0.
+        if done:
+            current_potential = 0.0
+            
         if not self.is_initialized:
             self.prev_potential = current_potential
             self.is_initialized = True

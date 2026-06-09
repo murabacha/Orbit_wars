@@ -172,7 +172,13 @@ def train(args):
                     is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
                     log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
                     joint_log_prob = ((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1).item()
-            learner_moves = act_proc.process_actions(p0_obs, player_id=config["player_id"], target_indices=sampled_targets.squeeze(0).cpu().numpy()[np.where(valid_source_mask)[0]].tolist(), allocation_indices=sampled_allocs.squeeze(0).cpu().numpy()[np.where(valid_source_mask)[0]].tolist())
+            # FIX: Pass the full unmasked arrays. ActionProcessor uses absolute indices.
+            learner_moves = act_proc.process_actions(
+                p0_obs, 
+                player_id=config["player_id"], 
+                target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), 
+                allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist()
+            )
             obs_list = env.step([learner_moves] + actions); done = (obs_list[0].get('status') != 'ACTIVE')
             reward = reward_shaper.calculate_reward(p0_obs, done, total_steps); total_ep_reward += reward
             processed['action_masks'] = action_masks_grid; ep_obs.append(processed); ep_targets.append(sampled_targets.squeeze(0).cpu().numpy()); ep_allocs.append(sampled_allocs.squeeze(0).cpu().numpy()); ep_logp.append(joint_log_prob); ep_values.append(value_t.item()); ep_rewards.append(reward); ep_dones.append(done)
