@@ -82,7 +82,7 @@ class TransformerPPOPolicy:
         valid_source_mask = is_source_owned & (mask == 1.0)
 
         log_p_target = target_dist.log_prob(target_actions)
-        log_p_alloc = alloc_dist.log_prob(allocation_actions.view(-1)).view(B, N)
+        log_p_alloc = allocation_dist.log_prob(allocation_actions.view(-1)).view(B, N)
 
         # FIX: Stabilize joint log prob by averaging over active entities
         valid_counts = torch.clamp(valid_source_mask.float().sum(dim=-1), min=1.0)

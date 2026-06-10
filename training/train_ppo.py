@@ -2,6 +2,7 @@
 Production-Grade Proximal Policy Optimization (PPO) Training Loop for Orbit Wars AI.
 Hardware-Agile: Automatically adapts to CPU or GPU (CUDA) based on availability.
 Includes Dynamic Entropy and Reward Shaping Decay.
+Supports Self-Play and Baseline training.
 """
 import argparse
 import math
@@ -21,6 +22,7 @@ from orbit_wars_ai.environment.observation_processor import ObservationProcessor
 from orbit_wars_ai.environment.action_processor import ActionProcessor
 from orbit_wars_ai.environment.rewards import RewardShaper
 from orbit_wars_ai.environment.wrapper import OrbitWarsWrapper
+from training.selfplay import SelfPlayManager
 
 def compute_gae(rewards, values, dones, gamma, gae_lambda, last_value):
     advantages = np.zeros_like(rewards)
@@ -119,13 +121,22 @@ def train(args):
         print(f"Loaded checkpoint from: {checkpoint_path}")
     model.to(device)
     
+    # Initialize Self-Play Opponent Model
+    opp_model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=config["max_entities"]).to(device)
+    opp_model.eval()
+    
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda') if device_type == 'cuda' else None
     wrapper_config = {"shipSpeed": 6.0, "sunRadius": 10.0, "boardSize": 100.0, "episodeSteps": 500}
     wrapper = OrbitWarsWrapper(wrapper_config)
     obs_proc = ObservationProcessor(max_entities=config["max_entities"], board_size=wrapper_config["boardSize"], max_speed=wrapper_config["shipSpeed"])
     act_proc = ActionProcessor(wrapper)
     reward_shaper = RewardShaper(player_id=config["player_id"], gamma=config["gamma"], total_training_steps=args.total_timesteps)
+    
+    self_play_manager = SelfPlayManager()
+    if args.opponent == 'selfplay':
+        # Add current checkpoint to history
+        self_play_manager.history.append(checkpoint_path)
+        print("Self-Play Mode Activated.")
 
     print(f"Relational Multi-Dispatch PPO initiated on: {device}")
     total_steps = args.start_step
@@ -138,63 +149,109 @@ def train(args):
         env = make("orbit_wars", debug=False)
         obs_list = env.reset()
         num_players = len(obs_list)
+        
+        # Matchmaking
+        current_opponent_path = "baseline"
+        if args.opponent == 'selfplay':
+            current_opponent_path = self_play_manager.get_opponent()
+            if current_opponent_path != "baseline_heuristic":
+                opp_model.load_state_dict(torch.load(current_opponent_path, map_location=device))
+        
         ep_obs, ep_targets, ep_allocs, ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], [], [], [], []
         total_ep_reward = 0
         done = False
         steps_counter = 0
+        
+        # Slot configuration
+        my_slot = 0 # Learner is always slot 0 for training simplicity
         baselines = [HeuristicBaseline(pid) for pid in range(num_players)]
+        
         while not done and steps_counter < 500:
-            actions = []
-            for pid in range(1, num_players):
-                if obs_list[pid]['status'] == 'ACTIVE':
-                    actions.append(baselines[pid].act(obs_list[pid]['observation']))
-                else: actions.append([])
-            p0_obs = obs_list[0]['observation']
-            processed = obs_proc.process(p0_obs, player_id=config["player_id"])
+            actions = [[] for _ in range(num_players)]
             
-            # FIX: Use 2D pairwise mask directly
-            full_mask = wrapper.get_action_mask(p0_obs, player_id=config["player_id"])
-            action_masks_grid = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool)
-            action_masks_grid[:full_mask.shape[0], :full_mask.shape[1]] = full_mask
-
-            model.eval()
-            with torch.no_grad():
-                with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
-                    ent_t = torch.tensor(processed['entities'], dtype=torch.float32).unsqueeze(0).to(device)
-                    ids_t = torch.tensor(processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device)
-                    msk_t = torch.tensor(processed['mask'], dtype=torch.float32).unsqueeze(0).to(device)
-                    amsk_t = torch.tensor(action_masks_grid, dtype=torch.bool).unsqueeze(0).to(device)
-                    target_logits, alloc_logits, value_t = model(ent_t, ids_t, msk_t, amsk_t)
-                    target_dist = torch.distributions.Categorical(logits=target_logits); sampled_targets = target_dist.sample()
-                    B, N, _ = ent_t.shape
-                    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N).reshape(-1); source_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).reshape(-1)
-                    selected_alloc_logits = alloc_logits[batch_idx, source_idx, sampled_targets.view(-1), :]
-                    alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits); sampled_allocs = alloc_dist.sample().view(B, N)
-                    is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
-                    log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
-                    # FIX: Use mean over active entities to stabilize gradients
-                    valid_counts = torch.clamp(torch.tensor(valid_source_mask, device=device).float().sum(dim=-1), min=1.0)
-                    joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1) / valid_counts).item()
-            # FIX: Pass the full unmasked arrays. ActionProcessor uses absolute indices.
-            learner_moves = act_proc.process_actions(
-                p0_obs, 
-                player_id=config["player_id"], 
-                target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), 
-                allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist()
-            )
-            obs_list = env.step([learner_moves] + actions); done = (obs_list[0].get('status') != 'ACTIVE')
-            reward = reward_shaper.calculate_reward(p0_obs, done, total_steps); total_ep_reward += reward
-            processed['action_masks'] = action_masks_grid; ep_obs.append(processed); ep_targets.append(sampled_targets.squeeze(0).cpu().numpy()); ep_allocs.append(sampled_allocs.squeeze(0).cpu().numpy()); ep_logp.append(joint_log_prob); ep_values.append(value_t.item()); ep_rewards.append(reward); ep_dones.append(done)
+            for pid in range(num_players):
+                if obs_list[pid]['status'] != 'ACTIVE': continue
+                raw_obs = obs_list[pid]['observation']
+                
+                if pid == my_slot:
+                    # LEARNER logic
+                    processed = obs_proc.process(raw_obs, player_id=pid)
+                    full_mask = wrapper.get_action_mask(raw_obs, player_id=pid)
+                    action_masks_grid = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool)
+                    action_masks_grid[:full_mask.shape[0], :full_mask.shape[1]] = full_mask
+                    
+                    model.eval()
+                    with torch.no_grad():
+                        with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
+                            ent_t = torch.tensor(processed['entities'], dtype=torch.float32).unsqueeze(0).to(device)
+                            ids_t = torch.tensor(processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device)
+                            msk_t = torch.tensor(processed['mask'], dtype=torch.float32).unsqueeze(0).to(device)
+                            amsk_t = torch.tensor(action_masks_grid, dtype=torch.bool).unsqueeze(0).to(device)
+                            target_logits, alloc_logits, value_t = model(ent_t, ids_t, msk_t, amsk_t)
+                            target_dist = torch.distributions.Categorical(logits=target_logits); sampled_targets = target_dist.sample()
+                            B, N, _ = ent_t.shape
+                            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N).reshape(-1); source_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).reshape(-1)
+                            selected_alloc_logits = alloc_logits[batch_idx, source_idx, sampled_targets.view(-1), :]
+                            alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits); sampled_allocs = alloc_dist.sample().view(B, N)
+                            is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
+                            log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
+                            valid_counts = torch.clamp(torch.tensor(valid_source_mask, device=device).float().sum(dim=-1), min=1.0)
+                            joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1) / valid_counts).item()
+                    
+                    actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist())
+                    
+                    # Store rollout data
+                    processed['action_masks'] = action_masks_grid; ep_obs.append(processed); ep_targets.append(sampled_targets.squeeze(0).cpu().numpy()); ep_allocs.append(sampled_allocs.squeeze(0).cpu().numpy()); ep_logp.append(joint_log_prob); ep_values.append(value_t.item()); ep_dones.append(False)
+                    
+                else:
+                    # OPPONENT logic
+                    if args.opponent == 'selfplay' and current_opponent_path != "baseline_heuristic":
+                        # Run Opponent Model Inference
+                        p_obs = obs_proc.process(raw_obs, player_id=pid)
+                        f_mask = wrapper.get_action_mask(raw_obs, player_id=pid)
+                        a_masks = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool)
+                        a_masks[:f_mask.shape[0], :f_mask.shape[1]] = f_mask
+                        with torch.no_grad():
+                            ent_o = torch.tensor(p_obs['entities'], dtype=torch.float32).unsqueeze(0).to(device)
+                            ids_o = torch.tensor(p_obs['entity_ids'], dtype=torch.long).unsqueeze(0).to(device)
+                            msk_o = torch.tensor(p_obs['mask'], dtype=torch.float32).unsqueeze(0).to(device)
+                            amsk_o = torch.tensor(a_masks, dtype=torch.bool).unsqueeze(0).to(device)
+                            t_logits, a_logits, _ = opp_model(ent_o, ids_o, msk_o, amsk_o)
+                            t_acts = t_logits.squeeze(0).argmax(dim=-1).cpu().numpy().tolist()
+                            a_acts = a_logits.squeeze(0)[torch.arange(config["max_entities"]), t_acts, :].argmax(dim=-1).cpu().numpy().tolist()
+                        actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=t_acts, allocation_indices=a_acts)
+                    else:
+                        # Fallback to Heuristic
+                        actions[pid] = baselines[pid].act(raw_obs)
+            
+            obs_list = env.step(actions)
+            done = (obs_list[my_slot].get('status') != 'ACTIVE') or all(s['status'] != 'ACTIVE' for i, s in enumerate(obs_list) if i != my_slot)
+            
+            # Use raw p0_obs for reward calculation
+            reward = reward_shaper.calculate_reward(obs_list[my_slot]['observation'], done, total_steps)
+            ep_rewards.append(reward); total_ep_reward += reward
             steps_counter += 1; total_steps += 1
-        last_obs = obs_list[0]['observation']; last_processed = obs_proc.process(last_obs, player_id=config["player_id"])
+            
+        # Update last state done flag
+        if len(ep_dones) > 0: ep_dones[-1] = True
+        
+        # Update win rate if in self-play
+        if args.opponent == 'selfplay' and current_opponent_path != "baseline_heuristic":
+            final_reward = obs_list[my_slot].get('reward', 0)
+            self_play_manager.update_win_rate(current_opponent_path, won=(final_reward > 0))
+
+        last_obs = obs_list[my_slot]['observation']; last_processed = obs_proc.process(last_obs, player_id=my_slot)
         with torch.no_grad():
             with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
                 v_ent = torch.tensor(last_processed['entities'], dtype=torch.float32).unsqueeze(0).to(device); v_ids = torch.tensor(last_processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device); v_msk = torch.tensor(last_processed['mask'], dtype=torch.float32).unsqueeze(0).to(device); _, _, last_val = model(v_ent, v_ids, v_msk)
-                # FIX: Bootstrap value is 0.0 if episode ended naturally, else use network value
                 bootstrap_val = 0.0 if done else last_val.item()
+                
         ep_adv, ep_ret = compute_gae(np.array(ep_rewards), np.array(ep_values), np.array(ep_dones), config["gamma"], config["gae_lambda"], bootstrap_val)
         obs_buffer.extend(ep_obs); targets_buffer.extend(ep_targets); allocs_buffer.extend(ep_allocs); log_probs_buffer.extend(ep_logp); advantages_buffer.extend(ep_adv); returns_buffer.extend(ep_ret)
-        print(f"E{episode} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
+        
+        opp_name = os.path.basename(current_opponent_path) if current_opponent_path != "baseline" else "Heuristic"
+        print(f"E{episode} | Opp: {opp_name} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
+        
         if len(returns_buffer) >= args.batch_size:
             # DYNAMIC ENTROPY DECAY: Linear from 0.01 to 0.001
             ent_start, ent_end = 0.01, 0.001
@@ -211,6 +268,10 @@ def train(args):
             os.makedirs("checkpoints", exist_ok=True)
             local_save_path = f'checkpoints/ppo_step_{total_steps}.pt'
             torch.save(model.state_dict(), local_save_path)
+            
+            if args.opponent == 'selfplay':
+                self_play_manager.save_checkpoint(model, total_steps)
+            
             gdrive_path = '/content/drive/MyDrive/OrbitWars_Checkpoints'
             if os.path.exists(gdrive_path):
                 import shutil
@@ -232,5 +293,6 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--bc_checkpoint', type=str, default='checkpoints/bc_pretrained.pt')
     parser.add_argument('--start_step', type=int, default=0)
+    parser.add_argument('--opponent', type=str, default='baseline', choices=['baseline', 'selfplay'])
     args = parser.parse_args()
     train(args)

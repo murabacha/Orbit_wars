@@ -31,25 +31,24 @@ class SelfPlayManager:
     def get_opponent(self) -> str:
         """
         Samples an opponent using a prioritized distribution.
-        Higher priority is given to opponents where win_rate is closest to 50%.
+        80% Latest Checkpoint (Escalation)
+        20% Prioritized Historical (Prevents Catastrophic Forgetting)
         """
         if not self.history:
             return "baseline_heuristic"
             
-        # Select components of the PFSP distribution
-        # 80% chance: Prioritized sampling based on difficulty
-        # 20% chance: Uniform random sampling to maintain general robustness
+        latest_checkpoint = self.history[-1]
+            
         if random.random() < 0.8:
-            # Calculate weights based on proximity to 0.5 win rate (the "sweet spot" for learning)
-            # Opponents we beat 100% or 0% of the time provide less gradient signal
+            # 80% of the time, fight the bleeding-edge version of itself
+            return latest_checkpoint
+        else:
+            # 20% of the time, sample historical opponents to prevent strategy cycling
             weights = []
             for path in self.history:
                 wr = self.win_rates.get(path, 0.5)
-                # Difficulty weight: 1.0 - abs(0.5 - wr) * 2
-                # This peaks at 1.0 when wr is 0.5 and drops to 0.0 at 0.0 or 1.0
+                # Prioritize opponents with a ~50% win rate (highest learning signal)
                 difficulty = 1.0 - abs(0.5 - wr) * 2
                 weights.append(max(0.05, difficulty))
             
             return random.choices(self.history, weights=weights, k=1)[0]
-        else:
-            return random.choice(self.history)
