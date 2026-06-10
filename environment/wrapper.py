@@ -88,9 +88,6 @@ class OrbitWarsWrapper:
         planets = [Planet(*p[:7]) for p in planets_raw]
         comet_ids = obs.get('comet_planet_ids', [])
         
-        # 2. Heuristic Masking: Batching ships for faster armada travel
-        MIN_STRIKE_FORCE = 15 
-        
         for s_idx, source in enumerate(planets):
             if s_idx >= self.max_entities: break
             if source.owner != player_id or source.ships < 1:
@@ -99,9 +96,8 @@ class OrbitWarsWrapper:
             # Always allow self-targeting as a "do-nothing" action to prevent uniform trap
             mask[s_idx, s_idx] = True
             
-            # If planet doesn't have enough ships, block all external launches (force batching)
-            if source.ships < MIN_STRIKE_FORCE:
-                continue
+            # REMOVED MIN_STRIKE_FORCE: Restoring full strategic autonomy to the agent.
+            # The agent must learn through the reward signal that batching is faster.
                 
             for t_idx, target in enumerate(planets):
                 if t_idx >= self.max_entities: break

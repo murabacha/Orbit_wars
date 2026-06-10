@@ -13,6 +13,7 @@ class OrbitWarsWrapper:
         self.sun_radius = config.get("sunRadius", 10.0)
         self.board_size = config.get("boardSize", 100.0)
         self.episode_steps = config.get("episodeSteps", 500)
+        self.max_entities = config.get("max_entities", 200)
 
     def calculate_speed(self, ships: int) -> float:
         if ships <= 0: return 1.0
@@ -78,20 +79,27 @@ class OrbitWarsWrapper:
 
     def get_action_mask(self, obs: Dict[str, Any], player_id: int, allocation_percentage: float = 1.0) -> np.ndarray:
         planets_raw = obs.get("planets", [])
-        num_planets = len(planets_raw)
-        # FIX: Return 2D mask (source, target) for pairwise path validation
-        mask = np.zeros((num_planets, num_planets), dtype=bool)
+        fleets_raw = obs.get("fleets", [])
+        actual_entity_count = len(planets_raw) + len(fleets_raw)
+        
+        # 1. Mask out invalid padding sources and targets
+        mask = np.zeros((self.max_entities, self.max_entities), dtype=bool)
+        
         planets = [Planet(*p[:7]) for p in planets_raw]
         comet_ids = obs.get('comet_planet_ids', [])
         
         for s_idx, source in enumerate(planets):
+            if s_idx >= self.max_entities: break
             if source.owner != player_id or source.ships < 1:
                 continue
             
-            # FIX: Always allow self-targeting as a "do-nothing" action to prevent uniform trap
+            # Always allow self-targeting as a "do-nothing" action to prevent uniform trap
             mask[s_idx, s_idx] = True
+            
+            # REMOVED MIN_STRIKE_FORCE: Restoring full strategic autonomy to the agent.
                 
             for t_idx, target in enumerate(planets):
+                if t_idx >= self.max_entities: break
                 if t_idx == s_idx:
                     continue
                 
@@ -224,7 +232,9 @@ class ActionProcessor:
             target_idx = target_indices[i]
             alloc_idx = allocation_indices[i]
             
-            if alloc_idx == 0 or target_idx >= len(planets):
+            # FIX: Skip if target is the source itself (self-targeting is a "do-nothing" action)
+            # or if the target index is invalid (padding/fleets).
+            if alloc_idx == 0 or target_idx >= len(planets) or target_idx == i:
                 continue
             
             target = planets[target_idx]

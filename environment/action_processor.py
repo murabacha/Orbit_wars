@@ -33,7 +33,9 @@ class ActionProcessor:
             target_idx = target_indices[i]
             alloc_idx = allocation_indices[i]
             
-            if alloc_idx == 0 or target_idx >= len(planets):
+            # FIX: Skip if target is the source itself (self-targeting is a "do-nothing" action)
+            # or if the target index is invalid (padding/fleets).
+            if alloc_idx == 0 or target_idx >= len(planets) or target_idx == i:
                 continue
             
             target = planets[target_idx]
