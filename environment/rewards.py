@@ -97,12 +97,17 @@ class RewardShaper:
         if done:
             # Note: Final rewards in Kaggle are usually in env.state[i].reward.
             # Here we assume they are passed in the obs dict under 'rewards'.
-            scores = obs.get('rewards', [0, 0, 0, 0])
-            # Check win condition relative to opponents
-            if scores[self.player_id] == max(scores) and scores[self.player_id] > 0:
-                terminal_reward = 1.0  # Normalized sparse win signal
+            
+            # FIX: Massive overriding terminal reward to dwarf PBRS penalties
+            planets = obs.get("planets", [])
+            fleets = obs.get("fleets", [])
+            my_ships = sum(p[5] for p in planets if p[1] == self.player_id) + sum(f[4] for f in fleets if f[1] == self.player_id)
+            enemy_ships = sum(p[5] for p in planets if p[1] != self.player_id and p[1] != -1) + sum(f[4] for f in fleets if f[1] != self.player_id and f[1] != -1)
+
+            if my_ships > enemy_ships:
+                terminal_reward = 1000.0  # Massive spike for victory
             else:
-                terminal_reward = -1.0 # Normalized sparse loss signal
+                terminal_reward = -1000.0 # Massive penalty for loss
                 
         # Aggregate final signal
         total_reward = terminal_reward + shaped_reward - physics_penalties
