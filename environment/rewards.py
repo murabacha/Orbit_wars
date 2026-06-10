@@ -22,7 +22,7 @@ class RewardShaper:
     def compute_potential(self, obs: Dict[str, Any], dense_weight: float) -> float:
         """
         Computes the absolute potential Phi(s) of the active state.
-        Phi(s) = (Total_Ships * W_s + Total_Production * W_p + Total_Planets * W_l) * dense_weight
+        Phi(s) = (Garrisoned_Ships * W_g + Transit_Ships * W_t + Total_Production * W_p + Total_Planets * W_l - Fleet_Count * W_f) * dense_weight
         """
         planets = obs.get("planets", [])
         fleets = obs.get("fleets", [])
@@ -32,36 +32,37 @@ class RewardShaper:
         my_planets = [p for p in planets if p[1] == self.player_id]
         my_fleets = [f for f in fleets if f[1] == self.player_id]
         
-        # Extraction metrics based on updated planet list index positions
+        # FIX 2: Split ships into garrisoned and transit to penalize long travel times
         # Planet structure: [id, owner, x, y, radius, ships, production]
-        # (Based on probing, ships is index 5, production is index 6)
-        # FIX: Index 5 is ships, Index 4 is radius. 
-        ships_on_planets = sum(p[5] for p in my_planets)
-        
-        # FIX: Index 4 is ships in standard Kaggle Fleet tuple
-        ships_in_fleets = sum(f[4] for f in my_fleets)
-        total_ships = ships_on_planets + ships_in_fleets
+        ships_garrisoned = sum(p[5] for p in my_planets)
+        # Fleet structure: [id, owner, source, target, ships, current_steps, total_steps]
+        ships_in_transit = sum(f[4] for f in my_fleets)
         
         total_production = sum(p[6] for p in my_planets)
         total_planets = len(my_planets)
+        active_fleet_count = len(my_fleets)
         
-        # Comet ownership bonus (heavily incentivizes capturing high-value resources)
+        # Comet ownership bonus
         comet_bonus = sum(5.0 for p in my_planets if p[0] in comet_ids)
         
-        # Base strategic potential coefficients
-        w_ships = 0.1
+        # STRATEGIC WEIGHTS
+        w_ships_garrisoned = 0.15  # High value for safe ships
+        w_ships_transit = 0.05     # Transit Depreciation (encourages short flights)
         w_production = 5.0
         w_planets = 10.0
+        w_fleet_penalty = -2.0     # The Fleet Tax (encourages batching)
         
         raw_potential = (
-            (total_ships * w_ships) + 
+            (ships_garrisoned * w_ships_garrisoned) + 
+            (ships_in_transit * w_ships_transit) + 
             (total_production * w_production) + 
             (total_planets * w_planets) + 
+            (active_fleet_count * w_fleet_penalty) + 
             comet_bonus
         )
         
         # Scale potential down linearly based on the active curriculum weight
-        return raw_potential * dense_weight
+        return max(0.0, raw_potential * dense_weight)
 
     def calculate_reward(self, obs: Dict[str, Any], done: bool, current_global_step: int = 0) -> float:
         """
@@ -87,27 +88,21 @@ class RewardShaper:
         shaped_reward = (self.gamma * current_potential) - self.prev_potential
         
         # 3. Environmental Physics Hazards Penalties (Sun / Comet Expiration)
-        # Check if the environment recorded fleet destructions this step
         physics_penalties = 0.0
-        # If your environment setup exposes step casualties, extract them here:
-        # e.g., physics_penalties += lost_ships_to_sun * 1.0
         
         # 4. Sparse Terminal Win/Loss Target Alignment
         terminal_reward = 0.0
         if done:
-            # Note: Final rewards in Kaggle are usually in env.state[i].reward.
-            # Here we assume they are passed in the obs dict under 'rewards'.
-            
-            # FIX: Massive overriding terminal reward to dwarf PBRS penalties
             planets = obs.get("planets", [])
             fleets = obs.get("fleets", [])
             my_ships = sum(p[5] for p in planets if p[1] == self.player_id) + sum(f[4] for f in fleets if f[1] == self.player_id)
             enemy_ships = sum(p[5] for p in planets if p[1] != self.player_id and p[1] != -1) + sum(f[4] for f in fleets if f[1] != self.player_id and f[1] != -1)
 
+            # FIX 3: Massive scale increase (±5000.0) to overcome PBRS drop-off dilution
             if my_ships > enemy_ships:
-                terminal_reward = 1000.0  # Massive spike for victory
+                terminal_reward = 5000.0  # Massive spike for victory
             else:
-                terminal_reward = -1000.0 # Massive penalty for loss
+                terminal_reward = -5000.0 # Massive penalty for loss
                 
         # Aggregate final signal
         total_reward = terminal_reward + shaped_reward - physics_penalties
