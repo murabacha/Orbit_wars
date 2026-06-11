@@ -134,7 +134,6 @@ def train(args):
     
     self_play_manager = SelfPlayManager()
     if args.opponent == 'selfplay':
-        # Add current checkpoint to history
         self_play_manager.history.append(checkpoint_path)
         print("Self-Play Mode Activated.")
 
@@ -160,7 +159,16 @@ def train(args):
             if current_opponent_path != "baseline_heuristic":
                 # FIX 4: Use RAM Cache to prevent catastrophic hard drive bottleneck
                 if current_opponent_path not in loaded_opponents_cache:
+                    
+                    # PREVENT OOM: Evict oldest model if cache gets too large
+                    if len(loaded_opponents_cache) >= 5: 
+                        oldest_key = next(iter(loaded_opponents_cache))
+                        del loaded_opponents_cache[oldest_key]
+                        if device_type == 'cuda':
+                            torch.cuda.empty_cache() # Free VRAM immediately
+                            
                     loaded_opponents_cache[current_opponent_path] = torch.load(current_opponent_path, map_location=device)
+                    
                 opp_model.load_state_dict(loaded_opponents_cache[current_opponent_path])
         
         ep_obs, ep_targets, ep_allocs, ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], [], [], [], []

@@ -109,6 +109,7 @@ class RewardShaper:
         else:
             self.prev_raw_potential = current_raw_potential
             
-        # FIX 3: Return unscaled reward to prevent MSE value loss starvation
-        # We rely on gradient clipping in the trainer to protect the trunk.
-        return total_unscaled_reward
+        # FIX 3: Re-introduce the scale to keep Value Target around [-5.0, 5.0]
+        # This prevents the Critic's MSE loss from exploding and triggering 
+        # massive gradient clipping that freezes the Actor.
+        return total_unscaled_reward / self.GLOBAL_REWARD_SCALE
