@@ -74,5 +74,6 @@ class TransformerPPOModel(nn.Module):
             # FIX: Use -1e4 instead of -1e9 to avoid FP16 (Half) overflow in AMP mode
             target_logits = target_logits.masked_fill(~action_masks, -1e4)
             
-        value = self.critic_head(global_latent)
+        # FIX 5: Detach global_latent to protect shared trunk from value loss explosions
+        value = self.critic_head(global_latent.detach())
         return target_logits, allocation_logits, value

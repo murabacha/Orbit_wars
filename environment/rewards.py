@@ -109,6 +109,6 @@ class RewardShaper:
         else:
             self.prev_raw_potential = current_raw_potential
             
-        # FIX 3: Scale down the final reward to keep Value Loss MSE from exploding
-        # This protects the shared Transformer features from massive gradients.
-        return total_unscaled_reward / self.GLOBAL_REWARD_SCALE
+        # FIX 3: Return unscaled reward to prevent MSE value loss starvation
+        # We rely on gradient clipping in the trainer to protect the trunk.
+        return total_unscaled_reward

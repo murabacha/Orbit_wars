@@ -48,8 +48,8 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     valid_source_mask = is_source_owned & (mask == 1.0)
     log_p_target = target_dist.log_prob(target_actions)
     log_p_alloc = alloc_dist.log_prob(alloc_actions.view(-1)).view(B, N)
-    # FIX: Use mean over active entities to stabilize gradients and prevent ratio explosion
-    joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
+    # FIX 1: Remove division by valid counts for joint log prob
+    joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1)
     total_entropy = ((target_dist.entropy() + alloc_dist.entropy().view(B, N)) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
     return joint_log_prob, total_entropy.mean(), values.squeeze(-1)
 
@@ -138,6 +138,9 @@ def train(args):
         self_play_manager.history.append(checkpoint_path)
         print("Self-Play Mode Activated.")
 
+    # FIX 4: Initialize RAM Cache for opponents outside the loop
+    loaded_opponents_cache = {}
+
     print(f"Relational Multi-Dispatch PPO initiated on: {device}")
     total_steps = args.start_step
     episode = 0
@@ -155,7 +158,10 @@ def train(args):
         if args.opponent == 'selfplay':
             current_opponent_path = self_play_manager.get_opponent()
             if current_opponent_path != "baseline_heuristic":
-                opp_model.load_state_dict(torch.load(current_opponent_path, map_location=device))
+                # FIX 4: Use RAM Cache to prevent catastrophic hard drive bottleneck
+                if current_opponent_path not in loaded_opponents_cache:
+                    loaded_opponents_cache[current_opponent_path] = torch.load(current_opponent_path, map_location=device)
+                opp_model.load_state_dict(loaded_opponents_cache[current_opponent_path])
         
         ep_obs, ep_targets, ep_allocs, ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], [], [], [], []
         total_ep_reward = 0
@@ -195,8 +201,9 @@ def train(args):
                             alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits); sampled_allocs = alloc_dist.sample().view(B, N)
                             is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
                             log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
-                            valid_counts = torch.clamp(torch.tensor(valid_source_mask, device=device).float().sum(dim=-1), min=1.0)
-                            joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1) / valid_counts).item()
+                            
+                            # FIX 1: Remove division by valid_counts
+                            joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1)).item()
                     
                     actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist())
                     
@@ -225,15 +232,18 @@ def train(args):
                         actions[pid] = baselines[pid].act(raw_obs)
             
             obs_list = env.step(actions)
-            done = (obs_list[my_slot].get('status') != 'ACTIVE') or all(s['status'] != 'ACTIVE' for i, s in enumerate(obs_list) if i != my_slot)
+            
+            # FIX 2: Check if game actually ended naturally vs hitting step 500
+            real_done = (obs_list[my_slot].get('status') != 'ACTIVE') or all(s['status'] != 'ACTIVE' for i, s in enumerate(obs_list) if i != my_slot)
+            done = real_done # Break the loop if naturally done
             
             # Use raw p0_obs for reward calculation
-            reward = reward_shaper.calculate_reward(obs_list[my_slot]['observation'], done, total_steps)
+            reward = reward_shaper.calculate_reward(obs_list[my_slot]['observation'], real_done, total_steps)
             ep_rewards.append(reward); total_ep_reward += reward
             steps_counter += 1; total_steps += 1
             
-        # Update last state done flag
-        if len(ep_dones) > 0: ep_dones[-1] = True
+        # FIX 2: Only flag as terminal if it ended naturally, not by 500-step timeout
+        if len(ep_dones) > 0: ep_dones[-1] = real_done
         
         # Update win rate if in self-play
         if args.opponent == 'selfplay' and current_opponent_path != "baseline_heuristic":
@@ -244,7 +254,9 @@ def train(args):
         with torch.no_grad():
             with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
                 v_ent = torch.tensor(last_processed['entities'], dtype=torch.float32).unsqueeze(0).to(device); v_ids = torch.tensor(last_processed['entity_ids'], dtype=torch.long).unsqueeze(0).to(device); v_msk = torch.tensor(last_processed['mask'], dtype=torch.float32).unsqueeze(0).to(device); _, _, last_val = model(v_ent, v_ids, v_msk)
-                bootstrap_val = 0.0 if done else last_val.item()
+                
+                # FIX 2: Bootstrap from last_val if truncated. Only 0 if truly terminal.
+                bootstrap_val = 0.0 if real_done else last_val.item()
                 
         ep_adv, ep_ret = compute_gae(np.array(ep_rewards), np.array(ep_values), np.array(ep_dones), config["gamma"], config["gae_lambda"], bootstrap_val)
         obs_buffer.extend(ep_obs); targets_buffer.extend(ep_targets); allocs_buffer.extend(ep_allocs); log_probs_buffer.extend(ep_logp); advantages_buffer.extend(ep_adv); returns_buffer.extend(ep_ret)

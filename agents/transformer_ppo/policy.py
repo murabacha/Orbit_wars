@@ -55,9 +55,8 @@ class TransformerPPOPolicy:
             log_p_target = target_dist.log_prob(target_actions) # [1, N]
             log_p_alloc = allocation_dist.log_prob(allocation_actions.view(-1)).view(B, N)
 
-            # FIX: Stabilize joint log prob by averaging over active entities
-            valid_counts = torch.clamp(valid_source_mask.float().sum(dim=-1), min=1.0)
-            joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1) / valid_counts
+            # FIX 1: Sum log probs to reflect joint action probability. Do NOT divide by valid_counts.
+            joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1)
 
         return target_actions.squeeze(0).cpu().numpy(), allocation_actions.squeeze(0).cpu().numpy(), joint_log_prob.item(), value.item()
 
@@ -84,10 +83,10 @@ class TransformerPPOPolicy:
         log_p_target = target_dist.log_prob(target_actions)
         log_p_alloc = allocation_dist.log_prob(allocation_actions.view(-1)).view(B, N)
 
-        # FIX: Stabilize joint log prob by averaging over active entities
-        valid_counts = torch.clamp(valid_source_mask.float().sum(dim=-1), min=1.0)
-        joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1) / valid_counts
+        # FIX 1: Sum log probs to reflect joint action probability
+        joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1)
         
+        # Keep the mean strictly for the entropy bonus calculation
         entropy = ((target_dist.entropy() + allocation_dist.entropy().view(B, N)) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
 
         return joint_log_prob, values.squeeze(-1), entropy.mean()
