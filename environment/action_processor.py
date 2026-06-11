@@ -17,7 +17,6 @@ class ActionProcessor:
         planets_raw = obs.get("planets", [])
         # Empirical test confirms Planet(*p[:7]) is CORRECT for [id, owner, x, y, radius, ships, prod]
         planets = [Planet(*p[:7]) for p in planets_raw]
-        my_planets = [p for p in planets if p.owner == player_id]
         
         comet_map = {}
         for group in obs.get('comets', []):
@@ -41,24 +40,38 @@ class ActionProcessor:
             target = planets[target_idx]
             target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}
             
+            # 2. Iterative Multi-Step Convergence for Allocation 5 (Exact Needed)
             if alloc_idx == 5:
-                num_ships = target.ships + 5
-                allocation_pct = 1.0
-                for _ in range(5):
-                    allocation_pct = min(1.0, num_ships / source.ships) if source.ships > 0 else 0
-                    _, travel_time, _, _ = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
-                    future_garrison = self.wrapper.estimate_future_garrison(target_data, travel_time)
-                    new_num_ships = min(source.ships, future_garrison + 5)
-                    if abs(new_num_ships - num_ships) < 1: break
-                    num_ships = new_num_ships
+                # FIX: Don't run conquer math on our own planets to avoid wasting ships
+                if target.owner == player_id:
+                    num_ships = int(source.ships * 0.25)
+                else:
+                    # Resolve the circular dependency: num_ships -> speed -> travel_time -> future_garrison -> num_ships
+                    num_ships = target.ships + 5
+                    allocation_pct = 1.0
+                    
+                    for _ in range(5): # Convergence loop
+                        allocation_pct = min(1.0, num_ships / source.ships) if source.ships > 0 else 0
+                        _, travel_time, _, _ = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
+                        future_garrison = self.wrapper.estimate_future_garrison(target_data, travel_time)
+                        
+                        new_num_ships = min(source.ships, future_garrison + 5)
+                        if abs(new_num_ships - num_ships) < 1:
+                            break
+                        num_ships = new_num_ships
             else:
+                # Standard Percentage Bins
                 allocs = [0.0, 0.25, 0.5, 0.75, 1.0]
                 allocation_pct = allocs[alloc_idx]
                 num_ships = int(source.ships * allocation_pct)
 
             if num_ships <= 0: continue
             
+            # 3. Final Intercept Calculation
             angle, travel_time, tx, ty = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
+            
+            # 4. Precise Path-to-Sun Safety
+            # Calculate safety using the distance to the moving intercept coordinate
             dist_to_intercept = math.hypot(tx - source.x, ty - source.y)
             if self.wrapper.is_path_safe(source.x, source.y, angle, dist_to_intercept):
                 all_moves.append([source.id, angle, num_ships])

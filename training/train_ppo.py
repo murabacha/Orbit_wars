@@ -109,7 +109,7 @@ def train(args):
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
     
     config = {
-        "player_id": 0, "gamma": 0.99, "gae_lambda": 0.95, "learning_rate": 2.5e-4,
+        "player_id": 0, "gamma": 0.99, "gae_lambda": 0.95, "learning_rate": 5e-5,
         "clip_range": 0.2, "value_coef": 0.5, "entropy_coef": 0.01, "max_entities": 200,
         "n_epochs": 4, "minibatch_size": 16, "device": device
     }

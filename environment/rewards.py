@@ -57,7 +57,7 @@ class RewardShaper:
             (active_fleet_count * w_fleet_penalty) + 
             comet_bonus
         )
-        return max(0.0, raw_potential)
+        return raw_potential
 
     def calculate_reward(self, obs: Dict[str, Any], done: bool, current_global_step: int = 0) -> float:
         """
