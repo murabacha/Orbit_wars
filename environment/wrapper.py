@@ -79,8 +79,6 @@ class OrbitWarsWrapper:
 
     def get_action_mask(self, obs: Dict[str, Any], player_id: int, allocation_percentage: float = 1.0) -> np.ndarray:
         planets_raw = obs.get("planets", [])
-        fleets_raw = obs.get("fleets", [])
-        actual_entity_count = len(planets_raw) + len(fleets_raw)
         
         # 1. Mask out invalid padding sources and targets
         mask = np.zeros((self.max_entities, self.max_entities), dtype=bool)
