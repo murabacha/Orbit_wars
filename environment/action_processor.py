@@ -45,6 +45,7 @@ class ActionProcessor:
                 # FIX: Don't run conquer math on our own planets to avoid wasting ships
                 if target.owner == player_id:
                     num_ships = int(source.ships * 0.25)
+                    allocation_pct = 0.25
                 else:
                     # Resolve the circular dependency: num_ships -> speed -> travel_time -> future_garrison -> num_ships
                     num_ships = target.ships + 5

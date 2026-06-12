@@ -1,68 +1,54 @@
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
+import math
 
 class RewardShaper:
     """
-    Stabilized RewardShaper for Orbit Wars.
-    Fixes:
-    1. Critic Explosion: Global scale to keep rewards in [-10, 10] range.
-    2. Gamma Bleed: Removes gamma from potential difference to stop the living penalty.
-    3. Curriculum Bleed: Applies dense_weight to the difference, not the absolute potential.
+    Pure Economic and Military Advantage Reward Shaper.
+    Reduces micro-management to prevent agent passivity.
     """
-    def __init__(self, player_id: int, gamma: float = 0.99, total_training_steps: int = 1_000_000):
+    def __init__(self, player_id: int, gamma: float = 0.99, 
+                 total_training_steps: int = 50_000_000):
         self.player_id = player_id
         self.gamma = gamma
         self.total_training_steps = total_training_steps
         
+        # State tracking flags for potential evaluations
         self.is_initialized = False
         self.prev_raw_potential = 0.0
         self.last_dense_weight = 1.0
 
-        # Protects the shared Transformer weights from gradient explosions
+        # Global scale to keep rewards in a sane range for the Critic
         self.GLOBAL_REWARD_SCALE = 1000.0 
 
     def compute_raw_potential(self, obs: Dict[str, Any]) -> float:
         """
-        Computes the absolute potential Phi(s) of the active state.
-        Uses strategic weights to encourage expansion and discourage over-fleet usage.
+        Pure Economic and Military Advantage Potential.
+        The agent must LEARN to batch ships because trickling results in dead ships (negative reward).
         """
         planets = obs.get("planets", [])
         fleets = obs.get("fleets", [])
-        comet_ids = obs.get('comet_planet_ids', [])
         
-        my_planets = [p for p in planets if p[1] == self.player_id]
-        my_fleets = [f for f in fleets if f[1] == self.player_id]
+        # 1. Total Military Strength
+        my_ships = sum(p[5] for p in planets if p[1] == self.player_id) + sum(f[4] for f in fleets if f[1] == self.player_id)
+        enemy_ships = sum(p[5] for p in planets if p[1] not in [self.player_id, -1]) + sum(f[4] for f in fleets if f[1] not in [self.player_id, -1])
         
-        # Correct index mapping: p[5]=ships, f[4]=ships
-        ships_garrisoned = sum(p[5] for p in my_planets)
-        ships_in_transit = sum(f[4] for f in my_fleets)
-        total_production = sum(p[6] for p in my_planets)
-        total_planets = len(my_planets)
-        active_fleet_count = len(my_fleets)
-        
-        comet_bonus = sum(5.0 for p in my_planets if p[0] in comet_ids)
+        # 2. Total Economic Engine
+        my_production = sum(p[6] for p in planets if p[1] == self.player_id)
+        enemy_production = sum(p[6] for p in planets if p[1] not in [self.player_id, -1])
         
         # Strategic Coefficients
-        w_ships_garrisoned = 0.15  
-        w_ships_transit = 0.05     
-        w_production = 5.0
-        w_planets = 10.0
-        w_fleet_penalty = -2.0     
+        # Objective: Maximize the gap between us and the enemy.
+        ship_advantage = (my_ships - enemy_ships) * 0.1
+        prod_advantage = (my_production - enemy_production) * 5.0
         
-        raw_potential = (
-            (ships_garrisoned * w_ships_garrisoned) + 
-            (ships_in_transit * w_ships_transit) + 
-            (total_production * w_production) + 
-            (total_planets * w_planets) + 
-            (active_fleet_count * w_fleet_penalty) + 
-            comet_bonus
-        )
+        raw_potential = ship_advantage + prod_advantage
         return raw_potential
 
     def calculate_reward(self, obs: Dict[str, Any], done: bool, current_global_step: int = 0) -> float:
         """
-        Calculates the refactored, stable reward signal.
-        Formula: (Terminal_Signal + (Phi(s') - Phi(s)) * Dense_Weight) / 1000
+        Calculates the telemetrically sound PBRS shaped reward term.
+        Formula: Reward = Sparse_Signal + [gamma * Phi(s') - Phi(s)]
         """
         # Calculate active curriculum weight (annealing linearly from 1.0 to 0.0)
         dense_weight = max(0.0, 1.0 - (current_global_step / self.total_training_steps))
@@ -70,7 +56,7 @@ class RewardShaper:
         
         current_raw_potential = self.compute_raw_potential(obs)
         
-        # Terminate potential at episode end
+        # FIX: If the episode is over, there is no future state. Potential must be 0.
         if done:
             current_raw_potential = 0.0
             
@@ -78,14 +64,11 @@ class RewardShaper:
             self.prev_raw_potential = current_raw_potential
             self.is_initialized = True
             
-        # FIX 1 & 2: Calculate difference FIRST to stop curriculum bleed, 
-        # and remove gamma from the shaping to stop the 'living penalty' bleed.
-        potential_diff = current_raw_potential - self.prev_raw_potential
+        # Potential-Based Shaping Calculation: F = Phi(s') - Phi(s)
+        # Using a simplified difference to keep gradients clean.
+        shaped_reward = (current_raw_potential - self.prev_raw_potential) * dense_weight
         
-        # Apply the annealing weight to the change in state, not the absolute state.
-        shaped_reward = potential_diff * dense_weight
-        
-        # Terminal Win/Loss Target Alignment
+        # Sparse Terminal Win/Loss Target Alignment
         terminal_reward = 0.0
         if done:
             planets = obs.get("planets", [])
@@ -93,23 +76,20 @@ class RewardShaper:
             my_ships = sum(p[5] for p in planets if p[1] == self.player_id) + sum(f[4] for f in fleets if f[1] == self.player_id)
             enemy_ships = sum(p[5] for p in planets if p[1] != self.player_id and p[1] != -1) + sum(f[4] for f in fleets if f[1] != self.player_id and f[1] != -1)
 
-            # design in thousands, but GLOBAL_REWARD_SCALE will keep it sane
+            # Massive spike to overcome potential collapse
             if my_ships > enemy_ships:
-                terminal_reward = 5000.0 
+                terminal_reward = 5000.0  
             else:
                 terminal_reward = -5000.0 
                 
-        # Aggregate unscaled signal
-        total_unscaled_reward = terminal_reward + shaped_reward
+        # Aggregate and scale final signal
+        total_reward = (terminal_reward + shaped_reward) / self.GLOBAL_REWARD_SCALE
         
-        # Update state anchors
+        # Maintain reference state anchors
         if done:
             self.is_initialized = False
             self.prev_raw_potential = 0.0
         else:
             self.prev_raw_potential = current_raw_potential
             
-        # FIX 3: Re-introduce the scale to keep Value Target around [-5.0, 5.0]
-        # This prevents the Critic's MSE loss from exploding and triggering 
-        # massive gradient clipping that freezes the Actor.
-        return total_unscaled_reward / self.GLOBAL_REWARD_SCALE
+        return total_reward
