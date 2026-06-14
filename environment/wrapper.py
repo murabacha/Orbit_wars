@@ -79,10 +79,9 @@ class OrbitWarsWrapper:
 
     def get_action_mask(self, obs: Dict[str, Any], player_id: int, allocation_percentage: float = 1.0) -> np.ndarray:
         planets_raw = obs.get("planets", [])
+        fleets = obs.get("fleets", []) # Fetch fleets for threat evaluation
         
-        # 1. Mask out invalid padding sources and targets
         mask = np.zeros((self.max_entities, self.max_entities), dtype=bool)
-        
         planets = [Planet(*p[:7]) for p in planets_raw]
         comet_ids = obs.get('comet_planet_ids', [])
         
@@ -91,20 +90,37 @@ class OrbitWarsWrapper:
             if source.owner != player_id or source.ships < 1:
                 continue
             
-            # Always allow self-targeting as a "do-nothing" action to prevent uniform trap
+            # Always allow self-targeting (Holding position / Recharging)
             mask[s_idx, s_idx] = True
             
-            # REMOVED MIN_STRIKE_FORCE: Restoring full strategic autonomy to the agent.
-            # The agent must learn through the reward signal that batching is faster.
+            # --- SMART STRIKE FORCE LOGIC ---
+            # Enforce batching to prevent the trickle loop
+            MIN_STRIKE_FORCE = max(25, source.production * 10)
+            
+            # THE SNIPE OVERRIDE: Check if this specific planet is being targeted
+            incoming_enemy_ships = sum(
+                f[4] for f in fleets 
+                if f[1] not in [player_id, -1] and f[3] == source.id
+            )
+            is_under_threat = incoming_enemy_ships > 0
+            
+            # If safe and below threshold, agent MUST wait. 
+            # If under threat, restriction drops instantly so it can react!
+            if source.ships < MIN_STRIKE_FORCE and not is_under_threat:
+                continue 
                 
             for t_idx, target in enumerate(planets):
                 if t_idx >= self.max_entities: break
-                if t_idx == s_idx:
-                    continue
+                if t_idx == s_idx: continue
                 
                 target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}
-                
                 angle, travel_time, tx, ty = self.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_percentage, obs)
+                
+                # Overkill / Tunnel Vision Prevention
+                incoming_friendly_ships = sum(f[4] for f in fleets if f[1] == player_id and f[3] == target.id)
+                estimated_future_garrison = self.estimate_future_garrison(target_data, travel_time)
+                if target.owner != player_id and incoming_friendly_ships > (estimated_future_garrison + 10):
+                    continue
                 
                 if target.id in comet_ids:
                     invalid_arrival = False
@@ -117,4 +133,5 @@ class OrbitWarsWrapper:
                 
                 if self.is_path_safe(source.x, source.y, angle, math.hypot(tx - source.x, ty - source.y)):
                     mask[s_idx, t_idx] = True
+                    
         return mask

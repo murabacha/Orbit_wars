@@ -1,102 +1,192 @@
 """
-Final Audited BC Data Collection.
-Synchronized with correct environment field indices: [id, owner, x, y, radius, ships, prod].
+Behavioral Cloning trainer (Dual-Head Pre-training).
+Trains both the Policy (Action Matching) and the Critic (Value Estimation) simultaneously.
 """
 import argparse
 import math
 import os
-import random
+import sys
+import gc
 import numpy as np
-from kaggle_environments import make
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 
-from orbit_wars_ai.agents.baseline.heuristic import HeuristicBaseline
-from orbit_wars_ai.environment.observation_processor import ObservationProcessor
-from orbit_wars_ai.environment.wrapper import OrbitWarsWrapper
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel
 
-def alloc_to_index(ships_to_send: int, source_ships: int) -> int:
-    if source_ships <= 0: return 0
-    frac = ships_to_send / float(source_ships)
-    bins = [0.0, 0.25, 0.5, 0.75, 1.0]
-    idx, best_diff = 0, float('inf')
-    for i, b in enumerate(bins):
-        d = abs(frac - b)
-        if d < best_diff:
-            best_diff, idx = d, i
-    return 5 if best_diff > 0.12 else idx
-
-def save_dataset(save_path, entities, ids, masks, targets, allocs):
-    if not entities: return
-    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
-    np.savez_compressed(save_path, entities=np.array(entities, dtype=np.float32), entity_ids=np.array(ids, dtype=np.int64), mask=np.array(masks, dtype=np.float32), target=np.array(targets, dtype=np.int64), alloc=np.array(allocs, dtype=np.int64))
-
-def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 200, checkpoint_interval: int = 500):
-    wrapper_config = {"shipSpeed": 6.0, "sunRadius": 10.0, "boardSize": 100.0, "episodeSteps": 500}
-    wrapper = OrbitWarsWrapper(wrapper_config)
-    entities_list, entity_ids_list, mask_list, target_list, alloc_list = [], [], [], [], []
-    collected = 0
-    if os.path.exists(save_path):
+class BCDataset(Dataset):
+    def __init__(self, npz_path: str):
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"Target dataset not found: {npz_path}")
+        data = np.load(npz_path)
+        self.entities = data['entities']
+        self.entity_ids = data['entity_ids']
+        self.mask = data['mask']
+        self.target = data['target']
+        self.alloc = data['alloc']
+        
+        # Load returns, default to 0.0 if loading an old dataset
         try:
-            with np.load(save_path) as data:
-                entities_list, entity_ids_list, mask_list, target_list, alloc_list = list(data['entities']), list(data['entity_ids']), list(data['mask']), list(data['target']), list(data['alloc'])
-            collected = len(entities_list)
-            print(f"✅ Successfully resumed from {collected}/{num_transitions}")
-        except: print("⚠️ Starting fresh.")
+            self.returns = data['returns']
+        except KeyError:
+            print("⚠️ 'returns' not found in dataset. Critic will not train optimally.")
+            self.returns = np.zeros(len(self.target), dtype=np.float32)
 
-    env = make('orbit_wars', debug=False)
-    episode = 0
-    while collected < num_transitions:
-        episode += 1
-        obs_list = env.reset()
-        num_players = len(obs_list)
-        baselines = [HeuristicBaseline(pid) for pid in range(num_players)]
-        obs_procs = [ObservationProcessor(max_entities=max_entities, board_size=100.0, max_speed=6.0) for _ in range(num_players)]
-        done, steps = False, 0
-        ep_matched = 0
-        while not done and collected < num_transitions and steps < 500:
-            actions = [baselines[pid].act(obs_list[pid]['observation']) if obs_list[pid]['status'] == 'ACTIVE' else [] for pid in range(num_players)]
-            for pid in range(num_players):
-                if obs_list[pid]['status'] != 'ACTIVE': continue
-                player_obs, player_moves = obs_list[pid]['observation'], actions[pid]
-                if player_moves:
-                    processed = obs_procs[pid].process(player_obs, player_id=pid)
-                    planets = player_obs.get('planets', [])
-                    raw_entity_ids = [p[0] for p in planets] + [f[0] for f in player_obs.get('fleets', [])]
-                    raw_entity_ids = raw_entity_ids[:processed['entity_ids'].shape[0]]
-                    step_targets, step_allocs, has_valid_move = np.zeros(max_entities, dtype=np.int64), np.zeros(max_entities, dtype=np.int64), False
-                    for m in player_moves:
-                        source_id, heuristic_angle, ships_to_send = m
-                        source_planet = next((p for p in planets if p[0] == source_id), None)
-                        if source_planet is None or source_id not in raw_entity_ids: continue
-                        s_index = raw_entity_ids.index(source_id)
-                        # Correct index: [2]=x, [3]=y, [4]=radius, [5]=ships
-                        src_x, src_y, src_rad, src_ships = source_planet[2], source_planet[3], source_planet[4], source_planet[5]
-                        target_id, best_diff = None, float('inf')
-                        for p in planets:
-                            if p[0] == source_id: continue
-                            # Planet list: [0:id, 1:owner, 2:x, 3:y, 4:radius, 5:ships, 6:prod]
-                            p_id, p_owner, px, py, p_rad, p_ships, p_prod = p[:7]
-                            tgt_model = {'x': px, 'y': py, 'radius': p_rad, 'id': p_id, 'owner': p_owner, 'production': p_prod, 'ships': p_ships, 'source_ships': src_ships}
-                            solver_angle, _, _, _ = wrapper.get_intercept_params((src_x, src_y), src_rad, tgt_model, ships_to_send/src_ships if src_ships > 0 else 0, player_obs)
-                            diff = abs(((solver_angle - heuristic_angle + math.pi) % (2 * math.pi)) - math.pi)
-                            if diff < best_diff: best_diff, target_id = diff, p_id
-                        if target_id is not None and target_id in raw_entity_ids and best_diff <= 0.25:
-                            step_targets[s_index], step_allocs[s_index], has_valid_move = raw_entity_ids.index(target_id), alloc_to_index(ships_to_send, src_ships), True
-                    if has_valid_move:
-                        entities_list.append(processed['entities']); entity_ids_list.append(processed['entity_ids']); mask_list.append(processed['mask']); target_list.append(step_targets); alloc_list.append(step_allocs); collected += 1
-                        ep_matched += 1
-                        if collected % 100 == 0: print(f"Collected {collected}/{num_transitions}...")
-                        if collected % checkpoint_interval == 0: save_dataset(save_path, entities_list, entity_ids_list, mask_list, target_list, alloc_list)
-                        if collected >= num_transitions: break
-            obs_list = env.step(actions); done = all(s.get('status') != 'ACTIVE' for s in obs_list); steps += 1
-        print(f"Episode {episode} finished. Matched: {ep_matched} transitions. Total: {collected}")
-    save_dataset(save_path, entities_list, entity_ids_list, mask_list, target_list, alloc_list)
+    def __len__(self):
+        return len(self.target)
+
+    def __getitem__(self, idx: int):
+        return {
+            'entities': self.entities[idx],
+            'entity_ids': self.entity_ids[idx],
+            'mask': self.mask[idx],
+            'target': self.target[idx],
+            'alloc': self.alloc[idx],
+            'returns': self.returns[idx]
+        }
+
+def collate_fn(batch):
+    return {
+        'entities': torch.tensor(np.stack([b['entities'] for b in batch]), dtype=torch.float32),
+        'entity_ids': torch.tensor(np.stack([b['entity_ids'] for b in batch]), dtype=torch.long),
+        'mask': torch.tensor(np.stack([b['mask'] for b in batch]), dtype=torch.float32),
+        'target': torch.tensor(np.stack([b['target'] for b in batch]), dtype=torch.long),
+        'alloc': torch.tensor(np.stack([b['alloc'] for b in batch]), dtype=torch.long),
+        'returns': torch.tensor(np.stack([b['returns'] for b in batch]), dtype=torch.float32)
+    }
+
+def train_bc(npz_path: str, epochs: int = 5, batch_size: int = 16, lr: float = 3e-4, 
+             device: str = 'cpu', save_path: str = 'checkpoints/bc_pretrained.pt'):
+    
+    print(f"🚀 Initializing Dual-Head BC Trainer [Batch Size: {batch_size}, Device: {device}, LR: {lr}]")
+    if 'cuda' in device:
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    dataset = BCDataset(npz_path)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True)
+
+    model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=200)
+    model.to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler('cuda') if 'cuda' in device else None
+    ce_loss = nn.CrossEntropyLoss(reduction='none')
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss, total_v_loss, total_valid = 0.0, 0.0, 0
+        correct_targets, correct_allocs = 0, 0
+
+        for batch in dataloader:
+            entities = batch['entities'].to(device)
+            entity_ids = batch['entity_ids'].to(device)
+            mask = batch['mask'].to(device)
+            targets = batch['target'].to(device)
+            allocs = batch['alloc'].to(device)
+            returns = batch['returns'].to(device) # Shape: [B]
+            
+            B, N = entities.shape[0], entities.shape[1]
+
+            optimizer.zero_grad(set_to_none=True)
+            
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
+                # We now unpack all three: Target, Alloc, AND Values
+                target_logits, alloc_logits, values = model(entities, entity_ids, mask)
+
+                is_source_owned = (entities[:, :, 2] == 1.0)
+                valid_mask = is_source_owned & (mask == 1.0)
+                
+                if not valid_mask.any(): continue
+
+                # 1. Targeting Loss (Actor)
+                flat_target_logits = target_logits.view(-1, N)
+                flat_targets = targets.view(-1)
+                t_loss = (ce_loss(flat_target_logits, flat_targets) * valid_mask.view(-1)).sum()
+                
+                # 2. Allocation Loss (Actor)
+                batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N).reshape(-1)
+                source_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).reshape(-1)
+                selected_alloc = alloc_logits[batch_idx, source_idx, targets.view(-1), :]
+                a_loss = (ce_loss(selected_alloc, allocs.view(-1)) * valid_mask.view(-1)).sum()
+
+                # 3. Value Estimation Loss (Critic) - Standard MSE
+                v_loss = F.mse_loss(values.squeeze(-1), returns)
+
+                # Combine Losses (0.5 is standard PPO value coefficient)
+                n_count = valid_mask.sum()
+                actor_loss = (t_loss + a_loss) / n_count
+                loss = actor_loss + (0.5 * v_loss)
+
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
+
+            with torch.no_grad():
+                correct_targets += ((flat_target_logits.argmax(-1) == flat_targets) * valid_mask.view(-1)).sum().item()
+                correct_allocs += ((selected_alloc.argmax(-1) == allocs.view(-1)) * valid_mask.view(-1)).sum().item()
+                total_valid += n_count.item()
+                total_loss += loss.item() * B
+                total_v_loss += v_loss.item() * B
+
+        if total_valid > 0:
+            print(f"Epoch {epoch+1:02d} | Total Loss: {total_loss/len(dataset):.4f} | V_Loss (Critic): {total_v_loss/len(dataset):.4f} | Target Acc: {100*correct_targets/total_valid:.2f}% | Alloc Acc: {100*correct_allocs/total_valid:.2f}%")
+        
+        if 'cuda' in device:
+            torch.cuda.empty_cache()
+
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    torch.save(model.state_dict(), save_path)
+    print(f"✅ Dual-Head Pre-training complete. Saved to {save_path}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--npz_path', type=str, default='data/bc_dataset/bc_data.npz')
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--save_path', type=str, default='checkpoints/bc_pretrained.pt')
+    args = parser.parse_args()
+    train_bc(
+        npz_path=args.npz_path, 
+        epochs=args.epochs, 
+        batch_size=args.batch_size, 
+        lr=args.lr,
+        device=args.device, 
+        save_path=args.save_path
+    )
+]['ids'])
+            mask_list.extend(ep_data[pid]['masks'])
+            target_list.extend(ep_data[pid]['targets'])
+            alloc_list.extend(ep_data[pid]['allocs'])
+            returns_list.extend([ep_return] * L) # Tag every frame with the outcome!
+            
+            collected += L
+            ep_matched += L
+            
+        print(f"Episode {episode} finished. Extracted {ep_matched} frames. Total: {collected}/{num_transitions}")
+        if collected % checkpoint_interval < 500: # Approximate saving
+            save_dataset(save_path, entities_list, entity_ids_list, mask_list, target_list, alloc_list, returns_list)
+
+    save_dataset(save_path, entities_list, entity_ids_list, mask_list, target_list, alloc_list, returns_list)
     print(f"Finalized dataset: {collected} rows.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num_transitions', type=int, default=10000)
+    parser.add_argument('--num_transitions', type=int, default=100000)
     parser.add_argument('--save_path', type=str, default='data/bc_dataset/bc_data.npz')
     parser.add_argument('--max_entities', type=int, default=200)
-    parser.add_argument('--checkpoint_interval', type=int, default=500)
+    parser.add_argument('--checkpoint_interval', type=int, default=2000)
     args = parser.parse_args()
     collect_rollouts(args.num_transitions, args.save_path, max_entities=args.max_entities, checkpoint_interval=args.checkpoint_interval)
