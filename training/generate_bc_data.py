@@ -71,15 +71,19 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
             print(f"✅ Successfully resumed from {collected}/{num_transitions}")
         except: print("⚠️ Starting fresh.")
 
-    env = make('orbit_wars', debug=False)
     episode = 0
-    
     while collected < num_transitions:
         episode += 1
+        
+        # FIX 1: Create a fresh environment every single episode to prevent memory leaks!
+        env = make('orbit_wars', debug=False)
+        
         num_players = random.choice([2, 4])
         selected_agents = [random.choice(AGENT_POOL) for _ in range(num_players)]
         
-        print(f"🎬 Episode {episode}: {num_players} players. Agents: {[os.path.basename(a) for a in selected_agents]}")
+        # Cleaner logging: show the relative path to differentiate between multiple 'main.py'
+        agent_names = [os.path.relpath(a, base_dir) for a in selected_agents]
+        print(f"🎬 Episode {episode}: {num_players} players. Agents: {agent_names}")
         
         # Run the match
         try:
@@ -112,32 +116,57 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
                     has_valid_move = False
                     
                     for m in action_i:
-                        if not (isinstance(m, list) and len(m) == 3): continue
-                        source_id, heuristic_angle, ships_to_send = m
-                        
-                        source_planet = next((p for p in planets if p[0] == source_id), None)
-                        if source_planet is None or source_id not in raw_entity_ids: continue
-                        
-                        s_index = raw_entity_ids.index(source_id)
-                        src_x, src_y, src_rad, src_ships = source_planet[2], source_planet[3], source_planet[4], source_planet[5]
-                        
-                        target_id, best_diff = None, float('inf')
-                        for p in planets:
-                            if p[0] == source_id: continue
-                            p_id, p_owner, px, py, p_rad, p_ships, p_prod = p[:7]
-                            frac = ships_to_send / src_ships if src_ships > 0 else 0
-                            tgt_model = {'x': px, 'y': py, 'radius': p_rad, 'id': p_id, 'owner': p_owner, 'production': p_prod, 'ships': p_ships, 'source_ships': src_ships}
+                        # --- BULLETPROOF ACTION PARSER ---
+                        target_id = None
+                        ships_to_send = 0
+                        source_id = None
+
+                        # Scenario A: The Kaggle Agent outputs a String (e.g. "Source_ID Allocation Target_ID")
+                        if isinstance(m, str):
+                            try:
+                                parts = m.split()
+                                source_id_str, alloc_str, target_id_str = parts[0], parts[1], parts[2]
+                                source_id = int(source_id_str)
+                                target_id = int(target_id_str)
+                                source_planet = next((p for p in planets if p[0] == source_id), None)
+                                if not source_planet: continue
+                                src_ships = source_planet[5]
+                                ships_to_send = int(src_ships * float(alloc_str))
+                            except: continue
+
+                        # Scenario B: The Kaggle Agent outputs your custom [Source, Angle, Ships] format
+                        elif isinstance(m, list) and len(m) == 3:
+                            source_id, heuristic_angle, ships_to_send = m
+                            source_planet = next((p for p in planets if p[0] == source_id), None)
+                            if not source_planet: continue
                             
-                            solver_angle, _, _, _ = wrapper.get_intercept_params((src_x, src_y), src_rad, tgt_model, frac, player_obs)
-                            diff = abs(((solver_angle - heuristic_angle + math.pi) % (2 * math.pi)) - math.pi)
-                            if diff < best_diff:
-                                best_diff = diff
-                                target_id = p_id
+                            src_x, src_y, src_rad, src_ships = source_planet[2], source_planet[3], source_planet[4], source_planet[5]
+                            best_diff = float('inf')
+                            
+                            for p in planets:
+                                if p[0] == source_id: continue
+                                p_id, p_owner, px, py, p_rad, p_ships, p_prod = p[:7]
+                                frac = ships_to_send / src_ships if src_ships > 0 else 0
+                                tgt_model = {'x': px, 'y': py, 'radius': p_rad, 'id': p_id, 'owner': p_owner, 'production': p_prod, 'ships': p_ships, 'source_ships': src_ships}
+                                
+                                solver_angle, _, _, _ = wrapper.get_intercept_params((src_x, src_y), src_rad, tgt_model, frac, player_obs)
+                                diff = abs(((solver_angle - heuristic_angle + math.pi) % (2 * math.pi)) - math.pi)
+                                if diff < best_diff:
+                                    best_diff = diff
+                                    target_id = p_id
+                                    
+                            if best_diff > 0.25: target_id = None # Angle was too messy, ignore
                         
-                        if target_id is not None and target_id in raw_entity_ids and best_diff <= 0.25:
+                        else:
+                            continue # Unknown format
+                            
+                        # --- RECORD THE VALIDATED MOVE ---
+                        if source_id in raw_entity_ids and target_id is not None and target_id in raw_entity_ids:
+                            s_index = raw_entity_ids.index(source_id)
                             t_index = raw_entity_ids.index(target_id)
+                            
                             step_targets[s_index] = t_index
-                            step_allocs[s_index] = alloc_to_index(ships_to_send, src_ships)
+                            step_allocs[s_index] = alloc_to_index(ships_to_send, source_planet[5])
                             has_valid_move = True
                             
                     if has_valid_move:
@@ -150,7 +179,8 @@ def collect_rollouts(num_transitions: int, save_path: str, max_entities: int = 2
         # Assign Terminal Returns
         ep_extracted = 0
         final_state = env.steps[-1]
-        all_rewards = [s.get('reward', 0) for s in final_state]
+        all_rewards = [s.get('reward', 0) for s in final_state if s.get('reward') is not None]
+        if not all_rewards: all_rewards = [0]
         max_reward = max(all_rewards)
         
         for pid in range(num_players):
