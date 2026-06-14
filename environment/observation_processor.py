@@ -65,6 +65,13 @@ class ObservationProcessor:
         owner_oh[planet.owner + 1] = 1.0
         lin_ships = planet.ships / 1000.0
         log_ships = math.log(max(1, planet.ships)) / math.log(1000.0)
+        
+        # --- NEW: Visual Memory ---
+        fleets = obs.get("fleets", [])
+        incoming_friendly = sum(f[4] for f in fleets if f[1] == planet.owner and f[1] != -1 and f[3] == planet.id)
+        incoming_enemy = sum(f[4] for f in fleets if f[1] != planet.owner and f[1] != -1 and f[3] == planet.id)
+        # --------------------------
+
         hub_travel_time = 0.0
         hub_arrival_garrison = lin_ships
         if hub and hub.id != planet.id:
@@ -73,7 +80,11 @@ class ObservationProcessor:
             raw_garrison = self.wrapper.estimate_future_garrison(planet_data, hub_travel_time)
             hub_arrival_garrison = raw_garrison / 1000.0
             hub_travel_time /= 100.0
-        return [planet.id / 500.0, *owner_oh, planet.x / self.board_size, planet.y / self.board_size, planet.radius / 10.0, lin_ships, log_ships, planet.production / 5.0, 1.0 if planet.id in comet_ids else 0.0, 0.0, 0.0, 0.0, hub_travel_time, hub_arrival_garrison]
+            
+        # Replaced the 0.0 padding slots with our incoming ship features!
+        return [planet.id / 500.0, *owner_oh, planet.x / self.board_size, planet.y / self.board_size, planet.radius / 10.0, 
+                lin_ships, log_ships, planet.production / 5.0, 1.0 if planet.id in comet_ids else 0.0, 
+                incoming_friendly / 1000.0, incoming_enemy / 1000.0, 0.0, hub_travel_time, hub_arrival_garrison]
 
     def _create_fleet_features(self, fleet: Fleet, hub: Planet, obs: Dict[str, Any]) -> List[float]:
         owner_oh = [0.0] * 5

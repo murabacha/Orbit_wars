@@ -150,11 +150,17 @@ def train(args):
         env = make("orbit_wars", debug=False)
         obs_list = env.reset()
         num_players = len(obs_list)
-        
+        # Matchmaking
         current_opponent_path = "baseline"
         if args.opponent == 'selfplay':
-            current_opponent_path = self_play_manager.get_opponent()
-            if current_opponent_path != "baseline_heuristic":
+
+            # FORCE matches against the BC model 20% of the time to stop trickling
+            if random.random() < 0.20:
+                current_opponent_path = args.bc_checkpoint
+            else:
+                current_opponent_path = self_play_manager.get_opponent()
+
+            if current_opponent_path != "baseline_heuristic" and current_opponent_path != args.bc_checkpoint:
                 if current_opponent_path not in loaded_opponents_cache:
                     if len(loaded_opponents_cache) >= 5: 
                         oldest_key = next(iter(loaded_opponents_cache))
@@ -162,6 +168,13 @@ def train(args):
                         if device_type == 'cuda': torch.cuda.empty_cache()
                     loaded_opponents_cache[current_opponent_path] = torch.load(current_opponent_path, map_location=device)
                 opp_model.load_state_dict(loaded_opponents_cache[current_opponent_path])
+
+            # Load BC model directly if chosen by the 20% anchor
+            elif current_opponent_path == args.bc_checkpoint:
+                 if current_opponent_path not in loaded_opponents_cache:
+                     loaded_opponents_cache[current_opponent_path] = torch.load(current_opponent_path, map_location=device)
+                 opp_model.load_state_dict(loaded_opponents_cache[current_opponent_path])
+
         
         ep_obs, ep_targets, ep_allocs, ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], [], [], [], []
         total_ep_reward = 0
