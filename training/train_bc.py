@@ -75,6 +75,12 @@ def train_bc(npz_path: str, epochs: int = 5, batch_size: int = 16, lr: float = 3
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda') if 'cuda' in device else None
     ce_loss = nn.CrossEntropyLoss(reduction='none')
+    
+    # NEW: Mitigate Dataset Imbalance (The "Hold Position" flood)
+    # The heuristic almost never launches (alloc=0 is 95% of the data).
+    # This weight prevents the network from learning to be "dormant" forever.
+    alloc_weights = torch.tensor([0.05, 1.0, 1.0, 1.0, 1.0, 1.0], device=device)
+    alloc_ce_loss = nn.CrossEntropyLoss(weight=alloc_weights, reduction='none')
 
     for epoch in range(epochs):
         model.train()
@@ -97,28 +103,40 @@ def train_bc(npz_path: str, epochs: int = 5, batch_size: int = 16, lr: float = 3
                 # We now unpack all three: Target, Alloc, AND Values
                 target_logits, alloc_logits, values = model(entities, entity_ids, mask)
 
+                # valid_mask finds "My Planets" (Index 2 is "ME")
                 is_source_owned = (entities[:, :, 2] == 1.0)
                 valid_mask = is_source_owned & (mask == 1.0)
                 
                 if not valid_mask.any(): continue
 
+                # --- TARGET FIXATION CURE ---
+                # Find out if the expert actually pressed the launch button
+                is_attacking = (allocs.view(-1) > 0).float()
+
                 # 1. Targeting Loss (Actor)
                 flat_target_logits = target_logits.view(-1, N)
                 flat_targets = targets.view(-1)
-                t_loss = (ce_loss(flat_target_logits, flat_targets) * valid_mask.view(-1)).sum()
                 
-                # 2. Allocation Loss (Actor)
+                # Multiply by is_attacking so 'Hold' actions don't force Target=0
+                t_loss = (ce_loss(flat_target_logits, flat_targets) * valid_mask.view(-1) * is_attacking).sum()
+                
+                # 2. Allocation Loss (Actor) - USING WEIGHTED LOSS
                 batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N).reshape(-1)
                 source_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).reshape(-1)
                 selected_alloc = alloc_logits[batch_idx, source_idx, targets.view(-1), :]
-                a_loss = (ce_loss(selected_alloc, allocs.view(-1)) * valid_mask.view(-1)).sum()
+                a_loss = (alloc_ce_loss(selected_alloc, allocs.view(-1)) * valid_mask.view(-1)).sum()
 
                 # 3. Value Estimation Loss (Critic) - Standard MSE
                 v_loss = F.mse_loss(values.squeeze(-1), returns)
 
-                # Combine Losses (0.5 is standard PPO value coefficient)
+                # Decouple averages so the rare attack frames generate strong gradients
                 n_count = valid_mask.sum()
-                actor_loss = (t_loss + a_loss) / n_count
+                n_attacking = (valid_mask.view(-1) * is_attacking).sum()
+                
+                t_loss_mean = t_loss / torch.clamp(n_attacking, min=1.0)
+                a_loss_mean = a_loss / torch.clamp(n_count, min=1.0)
+
+                actor_loss = t_loss_mean + a_loss_mean
                 loss = actor_loss + (0.5 * v_loss)
 
             if scaler:

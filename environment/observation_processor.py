@@ -35,13 +35,13 @@ class ObservationProcessor:
         
         for p_data in planets_raw:
             p_obj = Planet(*p_data[:7])
-            feat = self._create_planet_features(p_obj, hub, obs, comet_ids)
+            feat = self._create_planet_features(p_obj, hub, obs, comet_ids, player_id)
             entities.append(feat)
             entity_ids.append(p_obj.id)
 
         for f_data in fleets_raw:
             f_obj = Fleet(*f_data)
-            feat = self._create_fleet_features(f_obj, hub, obs)
+            feat = self._create_fleet_features(f_obj, hub, obs, player_id)
             entities.append(feat)
             entity_ids.append(f_obj.id)
 
@@ -60,16 +60,30 @@ class ObservationProcessor:
             "mask": np.array([1.0] * min(num_entities, self.max_entities) + [0.0] * max(0, self.max_entities - num_entities), dtype=np.float32)
         }
 
-    def _create_planet_features(self, planet: Planet, hub: Planet, obs: Dict[str, Any], comet_ids: List[int]) -> List[float]:
+    def _create_planet_features(self, planet: Planet, hub: Planet, obs: Dict[str, Any], comet_ids: List[int], player_id: int) -> List[float]:
         owner_oh = [0.0] * 5
-        owner_oh[planet.owner + 1] = 1.0
+        
+        # --- RELATIVE ENCODING FIX ---
+        if planet.owner == -1:
+            owner_oh[0] = 1.0 # Neutral
+        elif planet.owner == player_id:
+            owner_oh[1] = 1.0 # ALWAYS ME (Maps to feature index 2)
+        else:
+            # Shift all enemies to the remaining slots
+            enemy_idx = planet.owner if planet.owner < player_id else planet.owner - 1
+            if 0 <= enemy_idx <= 2:
+                owner_oh[2 + enemy_idx] = 1.0
+            else:
+                owner_oh[4] = 1.0
+        # -----------------------------
+
         lin_ships = planet.ships / 1000.0
         log_ships = math.log(max(1, planet.ships)) / math.log(1000.0)
         
         # --- NEW: Visual Memory ---
         fleets = obs.get("fleets", [])
-        incoming_friendly = sum(f[4] for f in fleets if f[1] == planet.owner and f[1] != -1 and f[3] == planet.id)
-        incoming_enemy = sum(f[4] for f in fleets if f[1] != planet.owner and f[1] != -1 and f[3] == planet.id)
+        incoming_friendly = sum(f[4] for f in fleets if f[1] == player_id and f[3] == planet.id)
+        incoming_enemy = sum(f[4] for f in fleets if f[1] != player_id and f[1] != -1 and f[3] == planet.id)
         # --------------------------
 
         hub_travel_time = 0.0
@@ -86,9 +100,19 @@ class ObservationProcessor:
                 lin_ships, log_ships, planet.production / 5.0, 1.0 if planet.id in comet_ids else 0.0, 
                 incoming_friendly / 1000.0, incoming_enemy / 1000.0, 0.0, hub_travel_time, hub_arrival_garrison]
 
-    def _create_fleet_features(self, fleet: Fleet, hub: Planet, obs: Dict[str, Any]) -> List[float]:
+    def _create_fleet_features(self, fleet: Fleet, hub: Planet, obs: Dict[str, Any], player_id: int) -> List[float]:
         owner_oh = [0.0] * 5
-        owner_oh[fleet.owner + 1] = 1.0
+        if fleet.owner == -1:
+            owner_oh[0] = 1.0
+        elif fleet.owner == player_id:
+            owner_oh[1] = 1.0
+        else:
+            enemy_idx = fleet.owner if fleet.owner < player_id else fleet.owner - 1
+            if 0 <= enemy_idx <= 2:
+                owner_oh[2 + enemy_idx] = 1.0
+            else:
+                owner_oh[4] = 1.0
+                
         lin_ships = fleet.ships / 1000.0
         log_ships = math.log(max(1, fleet.ships)) / math.log(1000.0)
         speed = self.wrapper.calculate_speed(fleet.ships)
