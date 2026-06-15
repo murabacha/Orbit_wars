@@ -267,8 +267,9 @@ def train(args):
         ep_adv, ep_ret = compute_gae(np.array(ep_rewards), np.array(ep_values), np.array(ep_dones), config["gamma"], config["gae_lambda"], bootstrap_val)
         obs_buffer.extend(ep_obs); targets_buffer.extend(ep_targets); allocs_buffer.extend(ep_allocs); log_probs_buffer.extend(ep_logp); advantages_buffer.extend(ep_adv); returns_buffer.extend(ep_ret)
         
-        opp_name = os.path.basename(current_opponent_path) if current_opponent_path != "baseline" else "Heuristic"
-        print(f"E{episode} | Opp: {opp_name} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
+        # Safely extract all opponent names from the list
+        opp_names = [os.path.basename(p) if p != "baseline" else "Heuristic" for p in opponent_paths]
+        print(f"E{episode} | Opps: {opp_names} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
         
         if len(returns_buffer) >= args.batch_size:
             ent_start, ent_end = 0.01, 0.001
