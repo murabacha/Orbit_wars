@@ -111,7 +111,7 @@ def train(args):
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
     
     config = {
-        "player_id": 0, "gamma": 0.99, "gae_lambda": 0.95, "learning_rate": 1e-5,
+        "player_id": 0, "gamma": 0.99, "gae_lambda": 0.95, "learning_rate": 5e-6,
         "clip_range": 0.1, "value_coef": 0.5, "entropy_coef": 0.01, "max_entities": 200,
         "n_epochs": 4, "minibatch_size": 16, "device": device
     }
@@ -141,6 +141,7 @@ def train(args):
     loaded_opponents_cache = {}
     print(f"Relational Multi-Dispatch PPO initiated on: {device}")
     total_steps = args.start_step
+    last_selfplay_save_step = total_steps
     episode = 0
     obs_buffer, targets_buffer, allocs_buffer = [], [], []
     log_probs_buffer, returns_buffer, advantages_buffer = [], [], []
@@ -148,33 +149,49 @@ def train(args):
     while total_steps < args.total_timesteps:
         episode += 1
         env = make("orbit_wars", debug=False)
-        obs_list = env.reset()
+        
+        # --- THE MULTI-PLAYER CRUCIBLE ---
+        # Randomly choose between 2 or 4 player matches
+        num_players = random.choice([2, 4]) if args.opponent == 'selfplay' else 2
+        
+        obs_list = env.reset(num_players)
         num_players = len(obs_list)
-        # Matchmaking
-        current_opponent_path = "baseline"
+        
+        # PPO Agent is always Player 0. Everyone else is an opponent.
+        opponent_paths = []
+        opp_models = []
+        
         if args.opponent == 'selfplay':
+            for _ in range(num_players - 1):
+                if random.random() < 0.20:
+                    opponent_paths.append(args.bc_checkpoint) # 20% Meta-Anchor
+                else:
+                    opponent_paths.append(self_play_manager.get_opponent())
 
-            # FORCE matches against the BC model 20% of the time to stop trickling
-            if random.random() < 0.20:
-                current_opponent_path = args.bc_checkpoint
-            else:
-                current_opponent_path = self_play_manager.get_opponent()
-
-            if current_opponent_path != "baseline_heuristic" and current_opponent_path != args.bc_checkpoint:
-                if current_opponent_path not in loaded_opponents_cache:
+            # Load models from cache to save VRAM
+            for opp_path in opponent_paths:
+                if opp_path == "baseline_heuristic":
+                    opp_models.append("heuristic")
+                    continue
+                    
+                if opp_path not in loaded_opponents_cache:
                     if len(loaded_opponents_cache) >= 5: 
                         oldest_key = next(iter(loaded_opponents_cache))
                         del loaded_opponents_cache[oldest_key]
                         if device_type == 'cuda': torch.cuda.empty_cache()
-                    loaded_opponents_cache[current_opponent_path] = torch.load(current_opponent_path, map_location=device)
-                opp_model.load_state_dict(loaded_opponents_cache[current_opponent_path])
-
-            # Load BC model directly if chosen by the 20% anchor
-            elif current_opponent_path == args.bc_checkpoint:
-                 if current_opponent_path not in loaded_opponents_cache:
-                     loaded_opponents_cache[current_opponent_path] = torch.load(current_opponent_path, map_location=device)
-                 opp_model.load_state_dict(loaded_opponents_cache[current_opponent_path])
-
+                    loaded_opponents_cache[opp_path] = torch.load(opp_path, map_location=device)
+                
+                # Create a temporary model to hold the weights for this specific opponent
+                temp_model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=200).to(device)
+                temp_model.load_state_dict(loaded_opponents_cache[opp_path])
+                temp_model.eval()
+                opp_models.append(temp_model)
+            
+            print(f"\n⚔️  Starting {num_players}-Player Match (Opponents: {[p.split('/')[-1] for p in opponent_paths]})")
+        else:
+            # Baseline mode
+            opp_models = ["heuristic"] * (num_players - 1)
+            opponent_paths = ["baseline"] * (num_players - 1)
         
         ep_obs, ep_targets, ep_allocs, ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], [], [], [], []
         total_ep_reward = 0
@@ -210,21 +227,24 @@ def train(args):
                             is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
                             log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
                             
-                            # FIX: Remove division by valid counts to restore gradient signal strength
                             joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1)).item()
                     
                     actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist())
                     processed['action_masks'] = action_masks_grid; ep_obs.append(processed); ep_targets.append(sampled_targets.squeeze(0).cpu().numpy()); ep_allocs.append(sampled_allocs.squeeze(0).cpu().numpy()); ep_logp.append(joint_log_prob); ep_values.append(value_t.item()); ep_dones.append(False)
                 else:
-                    if args.opponent == 'selfplay' and current_opponent_path != "baseline_heuristic":
+                    opp_idx = pid - 1
+                    opp_m = opp_models[opp_idx]
+                    
+                    if opp_m == "heuristic":
+                        actions[pid] = baselines[pid].act(raw_obs)
+                    else:
                         p_obs = obs_proc.process(raw_obs, player_id=pid)
                         f_mask = wrapper.get_action_mask(raw_obs, player_id=pid); a_masks = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool); a_masks[:f_mask.shape[0], :f_mask.shape[1]] = f_mask
                         with torch.no_grad():
                             ent_o = torch.tensor(p_obs['entities'], dtype=torch.float32).unsqueeze(0).to(device); ids_o = torch.tensor(p_obs['entity_ids'], dtype=torch.long).unsqueeze(0).to(device); msk_o = torch.tensor(p_obs['mask'], dtype=torch.float32).unsqueeze(0).to(device); amsk_o = torch.tensor(a_masks, dtype=torch.bool).unsqueeze(0).to(device)
-                            t_logits, a_logits, _ = opp_model(ent_o, ids_o, msk_o, amsk_o)
+                            t_logits, a_logits, _ = opp_m(ent_o, ids_o, msk_o, amsk_o)
                             t_acts = t_logits.squeeze(0).argmax(dim=-1).cpu().numpy().tolist(); a_acts = a_logits.squeeze(0)[torch.arange(config["max_entities"]), t_acts, :].argmax(dim=-1).cpu().numpy().tolist()
                         actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=t_acts, allocation_indices=a_acts)
-                    else: actions[pid] = baselines[pid].act(raw_obs)
             
             obs_list = env.step(actions)
             real_done = (obs_list[my_slot].get('status') != 'ACTIVE') or all(s['status'] != 'ACTIVE' for i, s in enumerate(obs_list) if i != my_slot)
@@ -233,9 +253,10 @@ def train(args):
             ep_rewards.append(reward); total_ep_reward += reward; steps_counter += 1; total_steps += 1
             
         if len(ep_dones) > 0: ep_dones[-1] = real_done
-        if args.opponent == 'selfplay' and current_opponent_path != "baseline_heuristic":
+        if args.opponent == 'selfplay' and len(opponent_paths) > 0:
             final_reward = obs_list[my_slot].get('reward', 0)
-            self_play_manager.update_win_rate(current_opponent_path, won=(final_reward > 0))
+            # Update win rate for the first opponent (simplification for multi-player)
+            self_play_manager.update_win_rate(opponent_paths[0], won=(final_reward > 0))
 
         last_obs = obs_list[my_slot]['observation']; last_processed = obs_proc.process(last_obs, player_id=my_slot)
         with torch.no_grad():
@@ -260,10 +281,20 @@ def train(args):
             print(f"Dense Weight: {reward_shaper.last_dense_weight:.3f} | Entropy Coef: {config['entropy_coef']:.4f}")
             print("------------------------------------\n")
             
+            # Keep your standard checkpointing for safety
             os.makedirs("checkpoints", exist_ok=True)
             local_save_path = f'checkpoints/ppo_step_{total_steps}.pt'
             torch.save(model.state_dict(), local_save_path)
-            if args.opponent == 'selfplay': self_play_manager.save_checkpoint(model, total_steps)
+            print(f"💾 PPO Update Complete. Weights updated at step {total_steps}.")
+            
+            # --- THE STABILITY FIX ---
+            # Only add the model to the self-play opponent pool every 20,000 steps!
+            # This forces the agent to master its current iteration before the meta shifts.
+            if args.opponent == 'selfplay' and (total_steps - last_selfplay_save_step >= 20000):
+                self_play_manager.save_checkpoint(model, total_steps)
+                last_selfplay_save_step = total_steps
+                print(f"🏆 Milestone Reached! Added version {total_steps} to Self-Play Pool.")
+
             gdrive_path = '/content/drive/MyDrive/OrbitWars_Checkpoints'
             if os.path.exists(gdrive_path):
                 import shutil

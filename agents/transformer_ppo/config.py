@@ -10,7 +10,7 @@ class TransformerPPOConfig:
     max_entities: int = 200
     
     # Training Hyperparameters
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-6
     gamma: float = 0.998 # Long horizon focus
     gae_lambda: float = 0.95
     clip_range: float = 0.2
