@@ -16,7 +16,7 @@ from orbit_wars_ai.environment.observation_processor import ObservationProcessor
 from orbit_wars_ai.environment.action_processor import ActionProcessor
 from orbit_wars_ai.environment.wrapper import OrbitWarsWrapper
 
-def run_battle_royale(checkpoint_path='checkpoints/ppo_step_199030.pt', output_path='bc_battle_royale.html'):
+def run_battle_royale(checkpoint_path='checkpoints/ppo_step_199536.pt', output_path='bc_battle_royale.html'):
     device = 'cpu'
     max_entities = 200
     

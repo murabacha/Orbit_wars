@@ -25,70 +25,69 @@ class RewardShaper:
     def calculate_reward(self, obs: Dict[str, Any], done: bool, current_global_step: int = 0, episode_step: int = 0) -> float:
         """
         Calculates the "Total Annihilation" reward.
-        Only rewards capturing planets and penalizes time.
+        Includes base capture rewards, production delta, and dense ship advantage.
         """
-        # Calculate active curriculum weight (annealing linearly from 1.0 to 0.0)
         dense_weight = max(0.0, 1.0 - (current_global_step / self.total_training_steps))
         self.last_dense_weight = dense_weight
         
         planets = obs.get("planets", [])
         fleets = obs.get("fleets", [])
         
-        # 1. Calculate Production (Planet Ownership)
+        # Track both production AND raw planet count to fix the asteroid issue
         my_prod_now = sum(p[6] for p in planets if p[1] == self.player_id)
         enemy_prod_now = sum(p[6] for p in planets if p[1] not in [self.player_id, -1])
+        my_planets_now = sum(1 for p in planets if p[1] == self.player_id)
+        enemy_planets_now = sum(1 for p in planets if p[1] not in [self.player_id, -1])
+        
+        my_total_ships = sum(p[5] for p in planets if p[1] == self.player_id) + sum(f[4] for f in fleets if f[1] == self.player_id)
+        enemy_total_ships = sum(p[5] for p in planets if p[1] not in [self.player_id, -1]) + sum(f[4] for f in fleets if f[1] not in [self.player_id, -1])
 
         if not self.is_initialized:
             self.prev_my_prod = my_prod_now
             self.prev_enemy_prod = enemy_prod_now
+            self.prev_my_planets = my_planets_now
+            self.prev_my_ships = my_total_ships
+            self.prev_enemy_ships = enemy_total_ships
             self.is_initialized = True
 
-        # 2. MASSIVE reward ONLY for capturing planets (Production Delta)
-        # It gets zero points for just sitting there letting ships grow.
+        # 1. Base capture reward (Fixes Problem 3: now it values 0-production asteroids)
+        planet_capture_reward = (my_planets_now - getattr(self, 'prev_my_planets', my_planets_now)) * 20.0
+        
+        # 2. Production Reward
         prod_reward = (my_prod_now - self.prev_my_prod) * 50.0 
         prod_penalty = (enemy_prod_now - self.prev_enemy_prod) * -50.0
         
-        # 3. The "Hurry Up" Penalty
-        # We charge the agent a tiny fee every step it leaves the enemy alive.
-        # This prevents AFK farming and forces it to conquer the whole map.
+        # 3. Dense Ship Advantage (Fixes Problem 5: rewards favorable trades and widening the gap)
+        ship_advantage_now = my_total_ships - enemy_total_ships
+        prev_ship_advantage = self.prev_my_ships - self.prev_enemy_ships
+        advantage_reward = (ship_advantage_now - prev_ship_advantage) * 0.1 * dense_weight
+        
+        # 4. The "Hurry Up" Penalty
         time_penalty = -0.05
         
-        # 4. The Waypoint Dominance
-        waypoint_bonus = 0.0
-        # Trigger massive evaluations on Turns 50, 100, and 150
-        if episode_step in [50, 100, 150]:
-            my_total_ships = sum(p[5] for p in planets if p[1] == self.player_id) + sum(f[4] for f in fleets if f[1] == self.player_id)
-            enemy_total_ships = sum(p[5] for p in planets if p[1] not in [self.player_id, -1]) + sum(f[4] for f in fleets if f[1] not in [self.player_id, -1])
-            
-            if my_total_ships > enemy_total_ships:
-                waypoint_bonus = 50.0
-            elif my_total_ships < enemy_total_ships:
-                waypoint_bonus = -50.0
-
-        # Sparse Terminal Win/Loss Target Alignment (Optional, keeping as a safety signal if done)
+        # 5. Terminal Win/Loss (Fixes Problem 2 & 4: aggressively rewards wiping the enemy out)
         terminal_reward = 0.0
         if done:
-            my_ships = sum(p[5] for p in planets if p[1] == self.player_id) + sum(f[4] for f in fleets if f[1] == self.player_id)
-            enemy_ships = sum(p[5] for p in planets if p[1] != self.player_id and p[1] != -1) + sum(f[4] for f in fleets if f[1] != self.player_id and f[1] != -1)
-            if my_ships > enemy_ships:
-                terminal_reward = 500.0  
+            if enemy_planets_now == 0:
+                # Massive bonus for an actual knockout 
+                terminal_reward = 1000.0 + (500 - episode_step) # Bonus for doing it fast
+            elif my_total_ships > enemy_total_ships:
+                # Small consolation prize for a timeout win, prevents hoarding
+                terminal_reward = 100.0  
             else:
                 terminal_reward = -500.0 
                 
-        # Aggregate final signal
-        # Note: We keep waypoint and terminal rewards separate from the production delta.
-        step_reward = prod_reward + prod_penalty + time_penalty + waypoint_bonus + terminal_reward
-        
-        # Scale for stability
+        step_reward = planet_capture_reward + prod_reward + prod_penalty + advantage_reward + time_penalty + terminal_reward
         total_reward = step_reward / self.GLOBAL_REWARD_SCALE
         
-        # Maintain reference state anchors
+        # Update anchors
         if done:
             self.is_initialized = False
-            self.prev_my_prod = 0.0
-            self.prev_enemy_prod = 0.0
         else:
             self.prev_my_prod = my_prod_now
             self.prev_enemy_prod = enemy_prod_now
+            self.prev_my_planets = my_planets_now
+            self.prev_my_ships = my_total_ships
+            self.prev_enemy_ships = enemy_total_ships
             
         return total_reward

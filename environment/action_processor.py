@@ -66,7 +66,17 @@ class ActionProcessor:
                 allocation_pct = allocs[alloc_idx]
                 num_ships = int(source.ships * allocation_pct)
 
-            if num_ships <= 0: continue
+            # THE BATCHING FIX: 
+            # If the fleet is too small, it moves too slow and wastes a turn. 
+            # Force it to act like a 0.0 allocation (wait) until it builds up.
+            if num_ships < 15: 
+                continue
+                
+            # THE SHUFFLING FIX:
+            # Prevent moving ships to our own planets unless using the exact intercept (alloc 5)
+            # This forces the network to spend its actions on outward aggression.
+            if target.owner == player_id and alloc_idx != 5:
+                continue
             
             # 3. Final Intercept Calculation
             angle, travel_time, tx, ty = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
