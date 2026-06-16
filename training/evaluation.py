@@ -58,6 +58,22 @@ class EvaluationTournament:
             
             batch_idx = torch.arange(self.max_entities, device=self.device)
             selected_alloc_logits = alloc_logits.squeeze(0)[batch_idx, sampled_targets, :]
+
+            # --- THE SMART VOLUME MASK ---
+            source_ships = (ent_t.squeeze(0)[:, 5] * 1000.0)
+            send_25 = source_ships * 0.25
+            send_50 = source_ships * 0.50
+            send_75 = source_ships * 0.75
+            
+            trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=self.device)
+            trickle_mask[:, 1] = send_25 < 20
+            trickle_mask[:, 2] = send_50 < 20
+            trickle_mask[:, 3] = send_75 < 20
+            trickle_mask[:, 5] = source_ships < 20
+            
+            selected_alloc_logits[trickle_mask] = -1e9
+            # -----------------------------
+            
             sampled_allocs = selected_alloc_logits.argmax(dim=-1)
 
         # PASS FULL LISTS: ActionProcessor now uses the planet's actual index (i) 

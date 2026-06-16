@@ -43,6 +43,29 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     source_idx = torch.arange(N, device=entities.device).unsqueeze(0).expand(B, -1).reshape(-1)
     chosen_targets = target_actions.view(-1)
     selected_alloc_logits = alloc_logits[batch_idx, source_idx, chosen_targets, :]
+    
+    # --- THE SMART VOLUME MASK ---
+    # Ships are stored at feature index 5. We multiply by 1000 to get the absolute count.
+    source_ships = (entities[:, :, 5] * 1000.0).view(-1)
+    
+    # Calculate exactly how many ships each percentage bin would send
+    # Bins: 0=0%, 1=25%, 2=50%, 3=75%, 4=100%, 5=Exact
+    send_25 = source_ships * 0.25
+    send_50 = source_ships * 0.50
+    send_75 = source_ships * 0.75
+    
+    trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=entities.device)
+    
+    # Block the fractional bins if they produce a useless fleet (< 20 ships)
+    trickle_mask[:, 1] = send_25 < 20
+    trickle_mask[:, 2] = send_50 < 20
+    trickle_mask[:, 3] = send_75 < 20
+    trickle_mask[:, 5] = source_ships < 20 # Block "Exact" if garrison is tiny
+    
+    # Force the probability of trickling to zero (-infinity)
+    selected_alloc_logits[trickle_mask] = -1e9
+    # -----------------------------
+
     alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits)
     is_source_owned = (entities[:, :, 2] == 1.0)
     valid_source_mask = is_source_owned & (mask == 1.0)
@@ -223,6 +246,20 @@ def train(args):
                             B, N, _ = ent_t.shape
                             batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N).reshape(-1); source_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).reshape(-1)
                             selected_alloc_logits = alloc_logits[batch_idx, source_idx, sampled_targets.view(-1), :]
+                            
+                            # --- THE SMART VOLUME MASK ---
+                            source_ships = (ent_t[:, :, 5] * 1000.0).view(-1)
+                            send_25 = source_ships * 0.25
+                            send_50 = source_ships * 0.50
+                            send_75 = source_ships * 0.75
+                            trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=device)
+                            trickle_mask[:, 1] = send_25 < 20
+                            trickle_mask[:, 2] = send_50 < 20
+                            trickle_mask[:, 3] = send_75 < 20
+                            trickle_mask[:, 5] = source_ships < 20 # Block "Exact" if garrison is tiny
+                            selected_alloc_logits[trickle_mask] = -1e9
+                            # -----------------------------
+
                             alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits); sampled_allocs = alloc_dist.sample().view(B, N)
                             is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
                             log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
@@ -243,14 +280,43 @@ def train(args):
                         with torch.no_grad():
                             ent_o = torch.tensor(p_obs['entities'], dtype=torch.float32).unsqueeze(0).to(device); ids_o = torch.tensor(p_obs['entity_ids'], dtype=torch.long).unsqueeze(0).to(device); msk_o = torch.tensor(p_obs['mask'], dtype=torch.float32).unsqueeze(0).to(device); amsk_o = torch.tensor(a_masks, dtype=torch.bool).unsqueeze(0).to(device)
                             t_logits, a_logits, _ = opp_m(ent_o, ids_o, msk_o, amsk_o)
-                            t_acts = t_logits.squeeze(0).argmax(dim=-1).cpu().numpy().tolist(); a_acts = a_logits.squeeze(0)[torch.arange(config["max_entities"]), t_acts, :].argmax(dim=-1).cpu().numpy().tolist()
+                            
+                            # --- THE SMART VOLUME MASK (Opponents also follow physics!) ---
+                            source_idx_o = torch.arange(config["max_entities"], device=device)
+                            t_acts = t_logits.squeeze(0).argmax(dim=-1)
+                            selected_alloc_logits_o = a_logits.squeeze(0)[source_idx_o, t_acts, :]
+                            
+                            source_ships_o = (ent_o[:, :, 5] * 1000.0).view(-1)
+                            send_25_o = source_ships_o * 0.25
+                            send_50_o = source_ships_o * 0.50
+                            send_75_o = source_ships_o * 0.75
+                            trickle_mask_o = torch.zeros((source_ships_o.shape[0], 6), dtype=torch.bool, device=device)
+                            trickle_mask_o[:, 1] = send_25_o < 20
+                            trickle_mask_o[:, 2] = send_50_o < 20
+                            trickle_mask_o[:, 3] = send_75_o < 20
+                            trickle_mask_o[:, 5] = source_ships_o < 20
+                            selected_alloc_logits_o[trickle_mask_o] = -1e9
+                            
+                            a_acts = selected_alloc_logits_o.argmax(dim=-1).cpu().numpy().tolist()
+                            t_acts = t_acts.cpu().numpy().tolist()
                         actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=t_acts, allocation_indices=a_acts)
             
             obs_list = env.step(actions)
             real_done = (obs_list[my_slot].get('status') != 'ACTIVE') or all(s['status'] != 'ACTIVE' for i, s in enumerate(obs_list) if i != my_slot)
             done = real_done
-            reward = reward_shaper.calculate_reward(obs_list[my_slot]['observation'], real_done, total_steps)
-            ep_rewards.append(reward); total_ep_reward += reward; steps_counter += 1; total_steps += 1
+            
+            # --- THE EFFICIENCY TAX ---
+            # Penalize the agent for pushing the launch button unnecessarily
+            # my_slot is always 0 (PPO Agent)
+            num_launches = (sampled_allocs > 0).sum().item()
+            order_tax = num_launches * 0.10
+            
+            reward = reward_shaper.calculate_reward(obs_list[my_slot]['observation'], real_done, total_steps, steps_counter)
+            
+            # Apply the Tax! (Scale it to match RewardShaper's global scale)
+            final_reward = reward - (order_tax / reward_shaper.GLOBAL_REWARD_SCALE)
+            
+            ep_rewards.append(final_reward); total_ep_reward += final_reward; steps_counter += 1; total_steps += 1
             
         if len(ep_dones) > 0: ep_dones[-1] = real_done
         if args.opponent == 'selfplay' and len(opponent_paths) > 0:
