@@ -18,6 +18,11 @@ from kaggle_environments import make
 
 from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel
 from orbit_wars_ai.agents.baseline.heuristic import HeuristicBaseline
+from orbit_wars_ai.agents.baseline.elite_heuristic import EliteHeuristic
+from online_agents.agent_1.main import agent as online_agent_1_func
+from online_agents.agent_2.main import agent as online_agent_2_func
+from online_agents.agent_3.main import agent as online_agent_3_func
+
 from orbit_wars_ai.environment.observation_processor import ObservationProcessor
 from orbit_wars_ai.environment.action_processor import ActionProcessor
 from orbit_wars_ai.environment.rewards import RewardShaper
@@ -45,24 +50,15 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     selected_alloc_logits = alloc_logits[batch_idx, source_idx, chosen_targets, :]
     
     # --- THE SMART VOLUME MASK ---
-    # Ships are stored at feature index 5. We multiply by 1000 to get the absolute count.
     source_ships = (entities[:, :, 5] * 1000.0).view(-1)
-    
-    # Calculate exactly how many ships each percentage bin would send
-    # Bins: 0=0%, 1=25%, 2=50%, 3=75%, 4=100%, 5=Exact
     send_25 = source_ships * 0.25
     send_50 = source_ships * 0.50
     send_75 = source_ships * 0.75
-    
     trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=entities.device)
-    
-    # Block the fractional bins if they produce a useless fleet (< 20 ships)
     trickle_mask[:, 1] = send_25 < 20
     trickle_mask[:, 2] = send_50 < 20
     trickle_mask[:, 3] = send_75 < 20
-    trickle_mask[:, 5] = source_ships < 20 # Block "Exact" if garrison is tiny
-    
-    # Force the probability of trickling to zero (-infinity)
+    trickle_mask[:, 5] = source_ships < 20
     selected_alloc_logits[trickle_mask] = -1e9
     # -----------------------------
 
@@ -71,10 +67,7 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     valid_source_mask = is_source_owned & (mask == 1.0)
     log_p_target = target_dist.log_prob(target_actions)
     log_p_alloc = alloc_dist.log_prob(alloc_actions.view(-1)).view(B, N)
-    
-    # FIX: Remove division by valid counts to restore gradient signal strength
     joint_log_prob = ((log_p_target + log_p_alloc) * valid_source_mask.float()).sum(dim=-1)
-    
     total_entropy = ((target_dist.entropy() + alloc_dist.entropy().view(B, N)) * valid_source_mask.float()).sum(dim=-1) / torch.clamp(valid_source_mask.sum(dim=-1), min=1.0)
     return joint_log_prob, total_entropy.mean(), values.squeeze(-1)
 
@@ -146,9 +139,6 @@ def train(args):
         print(f"Loaded checkpoint from: {checkpoint_path}")
     model.to(device)
     
-    opp_model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=config["max_entities"]).to(device)
-    opp_model.eval()
-    
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-4)
     wrapper_config = {"shipSpeed": 6.0, "sunRadius": 10.0, "boardSize": 100.0, "episodeSteps": 500}
     wrapper = OrbitWarsWrapper(wrapper_config)
@@ -172,29 +162,35 @@ def train(args):
     while total_steps < args.total_timesteps:
         episode += 1
         env = make("orbit_wars", debug=False)
-        
-        # --- THE MULTI-PLAYER CRUCIBLE ---
-        # Randomly choose between 2 or 4 player matches
         num_players = random.choice([2, 4]) if args.opponent == 'selfplay' else 2
-        
         obs_list = env.reset(num_players)
         num_players = len(obs_list)
         
-        # PPO Agent is always Player 0. Everyone else is an opponent.
         opponent_paths = []
         opp_models = []
         
+        heuristic_crucible = [
+            "baseline_heuristic", 
+            "elite_heuristic",
+            "online_agent_1",
+            "online_agent_2",
+            "online_agent_3"
+        ]
+
         if args.opponent == 'selfplay':
             for _ in range(num_players - 1):
-                if random.random() < 0.20:
-                    opponent_paths.append(args.bc_checkpoint) # 20% Meta-Anchor
+                rand_val = random.random()
+                if rand_val < 0.30:
+                    opponent_paths.append(random.choice(heuristic_crucible))
+                elif rand_val < 0.45:
+                    opponent_paths.append(args.bc_checkpoint)
                 else:
                     opponent_paths.append(self_play_manager.get_opponent())
 
             # Load models from cache to save VRAM
             for opp_path in opponent_paths:
-                if opp_path == "baseline_heuristic":
-                    opp_models.append("heuristic")
+                if opp_path in heuristic_crucible:
+                    opp_models.append(opp_path)
                     continue
                     
                 if opp_path not in loaded_opponents_cache:
@@ -204,17 +200,15 @@ def train(args):
                         if device_type == 'cuda': torch.cuda.empty_cache()
                     loaded_opponents_cache[opp_path] = torch.load(opp_path, map_location=device)
                 
-                # Create a temporary model to hold the weights for this specific opponent
                 temp_model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=200).to(device)
                 temp_model.load_state_dict(loaded_opponents_cache[opp_path])
                 temp_model.eval()
                 opp_models.append(temp_model)
             
-            print(f"\n⚔️  Starting {num_players}-Player Match (Opponents: {[p.split('/')[-1] for p in opponent_paths]})")
+            print(f"\n⚔️  Starting {num_players}-Player Match (Opponents: {[p.split('/')[-1] if '/' in p else p for p in opponent_paths]})")
         else:
-            # Baseline mode
-            opp_models = ["heuristic"] * (num_players - 1)
-            opponent_paths = ["baseline"] * (num_players - 1)
+            opp_models = ["baseline_heuristic"] * (num_players - 1)
+            opponent_paths = ["baseline_heuristic"] * (num_players - 1)
         
         ep_obs, ep_targets, ep_allocs, ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], [], [], [], []
         total_ep_reward = 0
@@ -256,14 +250,13 @@ def train(args):
                             trickle_mask[:, 1] = send_25 < 20
                             trickle_mask[:, 2] = send_50 < 20
                             trickle_mask[:, 3] = send_75 < 20
-                            trickle_mask[:, 5] = source_ships < 20 # Block "Exact" if garrison is tiny
+                            trickle_mask[:, 5] = source_ships < 20
                             selected_alloc_logits[trickle_mask] = -1e9
                             # -----------------------------
 
                             alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits); sampled_allocs = alloc_dist.sample().view(B, N)
                             is_source_owned = (processed['entities'][:, 2] == 1.0); valid_source_mask = is_source_owned & (processed['mask'] == 1.0)
                             log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
-                            
                             joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1)).item()
                     
                     actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist())
@@ -272,8 +265,17 @@ def train(args):
                     opp_idx = pid - 1
                     opp_m = opp_models[opp_idx]
                     
-                    if opp_m == "heuristic":
-                        actions[pid] = baselines[pid].act(raw_obs)
+                    if opp_m in heuristic_crucible:
+                        if opp_m == "baseline_heuristic":
+                            actions[pid] = baselines[pid].act(raw_obs)
+                        elif opp_m == "elite_heuristic":
+                            actions[pid] = EliteHeuristic(pid).act(raw_obs)
+                        elif opp_m == "online_agent_1":
+                            actions[pid] = online_agent_1_func(raw_obs)
+                        elif opp_m == "online_agent_2":
+                            actions[pid] = online_agent_2_func(raw_obs)
+                        elif opp_m == "online_agent_3":
+                            actions[pid] = online_agent_3_func(raw_obs)
                     else:
                         p_obs = obs_proc.process(raw_obs, player_id=pid)
                         f_mask = wrapper.get_action_mask(raw_obs, player_id=pid); a_masks = np.zeros((config["max_entities"], config["max_entities"]), dtype=bool); a_masks[:f_mask.shape[0], :f_mask.shape[1]] = f_mask
@@ -281,7 +283,6 @@ def train(args):
                             ent_o = torch.tensor(p_obs['entities'], dtype=torch.float32).unsqueeze(0).to(device); ids_o = torch.tensor(p_obs['entity_ids'], dtype=torch.long).unsqueeze(0).to(device); msk_o = torch.tensor(p_obs['mask'], dtype=torch.float32).unsqueeze(0).to(device); amsk_o = torch.tensor(a_masks, dtype=torch.bool).unsqueeze(0).to(device)
                             t_logits, a_logits, _ = opp_m(ent_o, ids_o, msk_o, amsk_o)
                             
-                            # --- THE SMART VOLUME MASK (Opponents also follow physics!) ---
                             source_idx_o = torch.arange(config["max_entities"], device=device)
                             t_acts = t_logits.squeeze(0).argmax(dim=-1)
                             selected_alloc_logits_o = a_logits.squeeze(0)[source_idx_o, t_acts, :]
@@ -305,23 +306,12 @@ def train(args):
             real_done = (obs_list[my_slot].get('status') != 'ACTIVE') or all(s['status'] != 'ACTIVE' for i, s in enumerate(obs_list) if i != my_slot)
             done = real_done
             
-            # --- THE EFFICIENCY TAX ---
-            # Penalize the agent for pushing the launch button unnecessarily
-            # my_slot is always 0 (PPO Agent)
-            num_launches = (sampled_allocs > 0).sum().item()
-            order_tax = num_launches * 0.10
-            
             reward = reward_shaper.calculate_reward(obs_list[my_slot]['observation'], real_done, total_steps, steps_counter)
-            
-            # Apply the Tax! (Scale it to match RewardShaper's global scale)
-            final_reward = reward - (order_tax / reward_shaper.GLOBAL_REWARD_SCALE)
-            
-            ep_rewards.append(final_reward); total_ep_reward += final_reward; steps_counter += 1; total_steps += 1
+            ep_rewards.append(reward); total_ep_reward += reward; steps_counter += 1; total_steps += 1
             
         if len(ep_dones) > 0: ep_dones[-1] = real_done
         if args.opponent == 'selfplay' and len(opponent_paths) > 0:
             final_reward = obs_list[my_slot].get('reward', 0)
-            # Update win rate for the first opponent (simplification for multi-player)
             self_play_manager.update_win_rate(opponent_paths[0], won=(final_reward > 0))
 
         last_obs = obs_list[my_slot]['observation']; last_processed = obs_proc.process(last_obs, player_id=my_slot)
@@ -333,8 +323,7 @@ def train(args):
         ep_adv, ep_ret = compute_gae(np.array(ep_rewards), np.array(ep_values), np.array(ep_dones), config["gamma"], config["gae_lambda"], bootstrap_val)
         obs_buffer.extend(ep_obs); targets_buffer.extend(ep_targets); allocs_buffer.extend(ep_allocs); log_probs_buffer.extend(ep_logp); advantages_buffer.extend(ep_adv); returns_buffer.extend(ep_ret)
         
-        # Safely extract all opponent names from the list
-        opp_names = [os.path.basename(p) if p != "baseline" else "Heuristic" for p in opponent_paths]
+        opp_names = [os.path.basename(p) if '/' in p else p for p in opponent_paths]
         print(f"E{episode} | Opps: {opp_names} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
         
         if len(returns_buffer) >= args.batch_size:
@@ -348,19 +337,13 @@ def train(args):
             print(f"Dense Weight: {reward_shaper.last_dense_weight:.3f} | Entropy Coef: {config['entropy_coef']:.4f}")
             print("------------------------------------\n")
             
-            # Keep your standard checkpointing for safety
             os.makedirs("checkpoints", exist_ok=True)
             local_save_path = f'checkpoints/ppo_step_{total_steps}.pt'
             torch.save(model.state_dict(), local_save_path)
-            print(f"💾 PPO Update Complete. Weights updated at step {total_steps}.")
             
-            # --- THE STABILITY FIX ---
-            # Only add the model to the self-play opponent pool every 20,000 steps!
-            # This forces the agent to master its current iteration before the meta shifts.
             if args.opponent == 'selfplay' and (total_steps - last_selfplay_save_step >= 20000):
                 self_play_manager.save_checkpoint(model, total_steps)
                 last_selfplay_save_step = total_steps
-                print(f"🏆 Milestone Reached! Added version {total_steps} to Self-Play Pool.")
 
             gdrive_path = '/content/drive/MyDrive/OrbitWars_Checkpoints'
             if os.path.exists(gdrive_path):
