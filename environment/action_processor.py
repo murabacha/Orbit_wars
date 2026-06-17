@@ -40,41 +40,20 @@ class ActionProcessor:
             target = planets[target_idx]
             target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}
             
-            # 2. Iterative Multi-Step Convergence for Allocation 5 (Exact Needed)
-            if alloc_idx == 5:
-                # FIX: Don't run conquer math on our own planets to avoid wasting ships
-                if target.owner == player_id:
-                    num_ships = int(source.ships * 0.25)
-                    allocation_pct = 0.25
-                else:
-                    # Resolve the circular dependency: num_ships -> speed -> travel_time -> future_garrison -> num_ships
-                    num_ships = target.ships + 5
-                    allocation_pct = 1.0
-                    
-                    for _ in range(5): # Convergence loop
-                        allocation_pct = min(1.0, num_ships / source.ships) if source.ships > 0 else 0
-                        _, travel_time, _, _ = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
-                        future_garrison = self.wrapper.estimate_future_garrison(target_data, travel_time)
-                        
-                        new_num_ships = min(source.ships, future_garrison + 5)
-                        if abs(new_num_ships - num_ships) < 1:
-                            break
-                        num_ships = new_num_ships
-            else:
-                # Standard Percentage Bins
-                allocs = [0.0, 0.25, 0.5, 0.75, 1.0]
-                allocation_pct = allocs[alloc_idx]
-                num_ships = int(source.ships * allocation_pct)
+            # Standard Percentage Bins ONLY. Clamp anything above 4.
+            allocs = [0.0, 0.25, 0.5, 0.75, 1.0]
+            safe_alloc_idx = min(alloc_idx, 4) 
+            allocation_pct = allocs[safe_alloc_idx]
+            
+            num_ships = int(source.ships * allocation_pct)
 
-            # THE BATCHING FIX: 
-            # STRICT WALL: No exceptions. Prevents the Alloc 5 micro-trickle exploit.
+            # THE UNBREAKABLE WALL
             if num_ships < 15: 
                 continue
                 
             # THE SHUFFLING FIX:
-            # Prevent moving ships to our own planets unless using the exact intercept (alloc 5)
-            # This forces the network to spend its actions on outward aggression.
-            if target.owner == player_id and alloc_idx != 5:
+            # Prevent moving ships to our own planets unless using 100% (evacuation)
+            if target.owner == player_id and safe_alloc_idx != 4:
                 continue
             
             # 3. Final Intercept Calculation

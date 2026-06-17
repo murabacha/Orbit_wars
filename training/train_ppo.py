@@ -55,10 +55,10 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     send_50 = source_ships * 0.50
     send_75 = source_ships * 0.75
     trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=entities.device)
-    trickle_mask[:, 1] = send_25 < 20
-    trickle_mask[:, 2] = send_50 < 20
-    trickle_mask[:, 3] = send_75 < 20
-    trickle_mask[:, 5] = False # NEVER block the Exact tactical strike
+    trickle_mask[:, 1] = send_25 < 15
+    trickle_mask[:, 2] = send_50 < 15
+    trickle_mask[:, 3] = send_75 < 15
+    # Allocation 5 is dead.
     selected_alloc_logits[trickle_mask] = -1e9
     # -----------------------------
 
@@ -247,10 +247,9 @@ def train(args):
                             send_50 = source_ships * 0.50
                             send_75 = source_ships * 0.75
                             trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=device)
-                            trickle_mask[:, 1] = send_25 < 20
-                            trickle_mask[:, 2] = send_50 < 20
-                            trickle_mask[:, 3] = send_75 < 20
-                            trickle_mask[:, 5] = False # NEVER block the Exact tactical strike
+                            trickle_mask[:, 1] = send_25 < 15
+                            trickle_mask[:, 2] = send_50 < 15
+                            trickle_mask[:, 3] = send_75 < 15
                             selected_alloc_logits[trickle_mask] = -1e9
                             # -----------------------------
 
@@ -293,10 +292,9 @@ def train(args):
                             send_50_o = source_ships_o * 0.50
                             send_75_o = source_ships_o * 0.75
                             trickle_mask_o = torch.zeros((source_ships_o.shape[0], 6), dtype=torch.bool, device=device)
-                            trickle_mask_o[:, 1] = send_25_o < 20
-                            trickle_mask_o[:, 2] = send_50_o < 20
-                            trickle_mask_o[:, 3] = send_75_o < 20
-                            trickle_mask_o[:, 5] = False # NEVER block the Exact tactical strike
+                            trickle_mask_o[:, 1] = send_25_o < 15
+                            trickle_mask_o[:, 2] = send_50_o < 15
+                            trickle_mask_o[:, 3] = send_75_o < 15
                             selected_alloc_logits_o[trickle_mask_o] = -1e9
                             
                             a_acts = selected_alloc_logits_o.argmax(dim=-1).cpu().numpy().tolist()
@@ -335,7 +333,7 @@ def train(args):
             model.train(); up_metrics = ppo_update(model, optimizer, rollout_data, config, epochs=config["n_epochs"], minibatch_size=config["minibatch_size"])
             print(f"\n--- PPO Update @ Step {total_steps} ---")
             print(f"Policy Loss: {up_metrics['pg_loss']:.4f} | Value Loss: {up_metrics['v_loss']:.4f} | Entropy: {up_metrics['entropy']:.4f}")
-            print(f"Dense Weight: {reward_shaper.last_dense_weight:.3f} | Entropy Coef: {config['entropy_coef']:.4f}")
+            print(f"Dense Weight: 0.000 | Entropy Coef: {config['entropy_coef']:.4f}")
             print("------------------------------------\n")
             
             os.makedirs("checkpoints", exist_ok=True)
