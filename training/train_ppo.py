@@ -18,7 +18,7 @@ from kaggle_environments import make
 
 from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel
 from orbit_wars_ai.agents.baseline.heuristic import HeuristicBaseline
-from orbit_wars_ai.agents.baseline.elite_heuristic import EliteHeuristic
+from orbit_wars_ai.agents.baseline.elite_heuristic import agent as elite_heuristic_func
 from online_agents.agent_1.main import agent as online_agent_1_func
 from online_agents.agent_2.main import agent as online_agent_2_func
 from online_agents.agent_3.main import agent as online_agent_3_func
@@ -269,7 +269,8 @@ def train(args):
                         if opp_m == "baseline_heuristic":
                             actions[pid] = baselines[pid].act(raw_obs)
                         elif opp_m == "elite_heuristic":
-                            actions[pid] = EliteHeuristic(pid).act(raw_obs)
+                            # Call it exactly like the online agents
+                            actions[pid] = elite_heuristic_func(raw_obs, wrapper_config)
                         elif opp_m == "online_agent_1":
                             actions[pid] = online_agent_1_func(raw_obs)
                         elif opp_m == "online_agent_2":
