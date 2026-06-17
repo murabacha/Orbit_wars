@@ -67,9 +67,8 @@ class ActionProcessor:
                 num_ships = int(source.ships * allocation_pct)
 
             # THE BATCHING FIX: 
-            # Drop the threshold to 10 for faster early games.
-            # EXCEPTION: Allow <10 if it's an Exact strike (5) or a desperate 100% all-in (4).
-            if num_ships < 10 and alloc_idx not in [4, 5]: 
+            # STRICT WALL: No exceptions. Prevents the Alloc 5 micro-trickle exploit.
+            if num_ships < 15: 
                 continue
                 
             # THE SHUFFLING FIX:

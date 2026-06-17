@@ -61,12 +61,12 @@ class RewardShaper:
         terminal_reward = 0.0
         if done:
             if enemy_planets_now == 0:
-                # 1000 base + huge bonus for finishing the game fast
-                terminal_reward = 1000.0 + (500 - episode_step) * 2 
-            elif my_total_ships > enemy_total_ships:
-                terminal_reward = 100.0  
+                # 1000 base + massive speed bonus to force closing out the game
+                terminal_reward = 1000.0 + (500 - episode_step) * 5 
             else:
-                terminal_reward = -500.0 
+                # PUNISH PASSIVITY: No more consolation prizes for having a bigger fleet.
+                # If the timer runs out and the enemy breathes, you failed.
+                terminal_reward = -300.0 * enemy_planets_now
                 
         step_reward = planet_capture_reward + prod_reward + prod_penalty + time_penalty + terminal_reward
         total_reward = step_reward / self.GLOBAL_REWARD_SCALE

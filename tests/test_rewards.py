@@ -54,8 +54,29 @@ class TestRewardShaper(unittest.TestCase):
             "fleets": []
         }
         r = self.shaper.calculate_reward(obs2, True, episode_step=100)
-        # Terminal knockout reward: 1000 + (500 - 100) * 2 = 1800. Scale / 1000 = 1.8
-        self.assertGreater(r, 1.5)
+        # Terminal knockout reward: 1000 + (500 - 100) * 5 = 3000. Scale / 1000 = 3.0
+        self.assertAlmostEqual(r, 3.00, delta=0.1)
+
+    def test_passivity_penalty(self):
+        # Initialization
+        obs1 = {"planets": [[0, 0, 10, 10, 1, 100, 5], [1, 1, 40, 40, 1, 10, 1]], "fleets": []}
+        self.shaper.calculate_reward(obs1, False)
+
+        # End game with 1 enemy planet still standing
+        obs2 = {
+            "planets": [
+                [0, 0, 10, 10, 1, 1000, 5],
+                [1, 1, 40, 40, 1, 10, 1]
+            ],
+            "fleets": []
+        }
+        # Even if we have more ships (1000 vs 10), it's a penalty now.
+        r = self.shaper.calculate_reward(obs2, True, episode_step=500)
+        # Penalty: -300.0 * 1 = -300.0. Scale / 1000 = -0.3
+        # Other components: time penalty -0.5. 
+        # Total approx -300.5 / 1000 = -0.3005
+        self.assertLess(r, 0)
+        self.assertAlmostEqual(r, -0.3005, delta=0.01)
 
 if __name__ == "__main__":
     unittest.main()
