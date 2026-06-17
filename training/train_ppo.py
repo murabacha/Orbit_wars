@@ -58,7 +58,7 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     trickle_mask[:, 1] = send_25 < 20
     trickle_mask[:, 2] = send_50 < 20
     trickle_mask[:, 3] = send_75 < 20
-    trickle_mask[:, 5] = source_ships < 20
+    trickle_mask[:, 5] = False # NEVER block the Exact tactical strike
     selected_alloc_logits[trickle_mask] = -1e9
     # -----------------------------
 
@@ -250,7 +250,7 @@ def train(args):
                             trickle_mask[:, 1] = send_25 < 20
                             trickle_mask[:, 2] = send_50 < 20
                             trickle_mask[:, 3] = send_75 < 20
-                            trickle_mask[:, 5] = source_ships < 20
+                            trickle_mask[:, 5] = False # NEVER block the Exact tactical strike
                             selected_alloc_logits[trickle_mask] = -1e9
                             # -----------------------------
 
@@ -295,7 +295,7 @@ def train(args):
                             trickle_mask_o[:, 1] = send_25_o < 20
                             trickle_mask_o[:, 2] = send_50_o < 20
                             trickle_mask_o[:, 3] = send_75_o < 20
-                            trickle_mask_o[:, 5] = source_ships_o < 20
+                            trickle_mask_o[:, 5] = False # NEVER block the Exact tactical strike
                             selected_alloc_logits_o[trickle_mask_o] = -1e9
                             
                             a_acts = selected_alloc_logits_o.argmax(dim=-1).cpu().numpy().tolist()

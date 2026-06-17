@@ -75,7 +75,8 @@ class OrbitWarsWrapper:
         t = max(0.0, min(dist, dx * vx + dy * vy))
         closest_x, closest_y = source_x + t * vx, source_y + t * vy
         
-        return math.hypot(closest_x - center_val, closest_y - center_val) > self.sun_radius
+        # ADD +3.0 HERE:
+        return math.hypot(closest_x - center_val, closest_y - center_val) > (self.sun_radius + 3.0)
 
     def get_action_mask(self, obs: Dict[str, Any], player_id: int, allocation_percentage: float = 1.0) -> np.ndarray:
         planets_raw = obs.get("planets", [])
@@ -104,6 +105,10 @@ class OrbitWarsWrapper:
                 target_data = {'x': target.x, 'y': target.y, 'radius': target.radius, 'id': target.id, 'owner': target.owner, 'production': target.production, 'ships': target.ships, 'source_ships': source.ships}
                 
                 angle, travel_time, tx, ty = self.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_percentage, obs)
+                
+                # ADD THIS OOB FIX:
+                if travel_time > 150.0:
+                    continue
                 
                 # Physical Rule: Comet timing
                 if target.id in comet_ids:

@@ -14,23 +14,29 @@ class TestActionProcessor(unittest.TestCase):
         self.assertEqual(len(moves), 0)
 
     def test_batching_fix(self):
-        # Source has 10 ships, trying to send 100% (10 ships)
+        # NEW RULE: Threshold is 10.
+        # Source has 9 ships, trying to send 100% (9 ships) - All-in (4)
         obs = {
             "planets": [
-                [0, 0, 10, 10, 1, 10, 5],
+                [0, 0, 10, 10, 1, 9, 5],
                 [1, -1, 40, 40, 1, 10, 1]
             ],
             "fleets": []
         }
-        # Target index 1, Allocation index 4 (100% = 10 ships)
+        # Target index 1, Allocation index 4 (100% = 9 ships)
+        # Exception: 4 and 5 are allowed even if < 10.
         moves = self.processor.process_actions(obs, 0, [1], [4])
-        # Should be skipped because 10 < 15
+        self.assertEqual(len(moves), 1)
+
+        # Source has 36 ships, trying to send 25% (9 ships) - Bin (1)
+        # Should be skipped because 9 < 10 and alloc_idx (1) is not in [4, 5]
+        obs["planets"][0][5] = 36
+        moves = self.processor.process_actions(obs, 0, [1], [1])
         self.assertEqual(len(moves), 0)
 
         # Source has 100 ships, trying to send 25% (25 ships)
         obs["planets"][0][5] = 100
         moves = self.processor.process_actions(obs, 0, [1], [1])
-        # Should NOT be skipped because 25 >= 15
         self.assertEqual(len(moves), 1)
 
     def test_shuffling_fix(self):
@@ -47,7 +53,7 @@ class TestActionProcessor(unittest.TestCase):
         # Should be skipped by shuffling fix
         self.assertEqual(len(moves), 0)
 
-        # But allocation 5 (intercept) should still work for own planets (per existing logic)
+        # But allocation 5 (intercept) should still work for own planets
         moves = self.processor.process_actions(obs, 0, [1], [5])
         self.assertEqual(len(moves), 1)
 

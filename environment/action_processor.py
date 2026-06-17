@@ -67,9 +67,9 @@ class ActionProcessor:
                 num_ships = int(source.ships * allocation_pct)
 
             # THE BATCHING FIX: 
-            # If the fleet is too small, it moves too slow and wastes a turn. 
-            # Force it to act like a 0.0 allocation (wait) until it builds up.
-            if num_ships < 15: 
+            # Drop the threshold to 10 for faster early games.
+            # EXCEPTION: Allow <10 if it's an Exact strike (5) or a desperate 100% all-in (4).
+            if num_ships < 10 and alloc_idx not in [4, 5]: 
                 continue
                 
             # THE SHUFFLING FIX:
