@@ -54,11 +54,21 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     send_25 = source_ships * 0.25
     send_50 = source_ships * 0.50
     send_75 = source_ships * 0.75
+    send_100 = source_ships * 1.0
+
     trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=entities.device)
-    trickle_mask[:, 1] = send_25 < 15
-    trickle_mask[:, 2] = send_50 < 15
-    trickle_mask[:, 3] = send_75 < 15
-    # Allocation 5 is dead.
+    trickle_mask[:, 1] = send_25 < 15.0
+    trickle_mask[:, 2] = send_50 < 15.0
+    trickle_mask[:, 3] = send_75 < 15.0
+    trickle_mask[:, 4] = send_100 < 15.0 # FIX: Mask 100% for tiny planets
+    trickle_mask[:, 5] = True # FIX: Allocation 5 is permanently dead
+    
+    # THE SHUFFLE MASK: Block useless intra-empire shuffling
+    target_is_owned = (entities[batch_idx, chosen_targets, 2] == 1.0)
+    trickle_mask[target_is_owned, 1] = True
+    trickle_mask[target_is_owned, 2] = True
+    trickle_mask[target_is_owned, 3] = True
+
     selected_alloc_logits[trickle_mask] = -1e9
     # -----------------------------
 
@@ -127,8 +137,9 @@ def train(args):
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
     
     config = {
-        "player_id": 0, "gamma": 0.99, "gae_lambda": 0.95, "learning_rate": 5e-6,
-        "clip_range": 0.1, "value_coef": 0.5, "entropy_coef": 0.01, "max_entities": 200,
+        "player_id": 0, "gamma": 0.99, "gae_lambda": 0.95, "learning_rate": 1e-5,
+        "clip_range": 0.05, # Max 5% policy change per update (The Straightjacket)
+        "value_coef": 0.5, "entropy_coef": 0.002, "max_entities": 200,
         "n_epochs": 4, "minibatch_size": 16, "device": device
     }
     
@@ -242,14 +253,25 @@ def train(args):
                             selected_alloc_logits = alloc_logits[batch_idx, source_idx, sampled_targets.view(-1), :]
                             
                             # --- THE SMART VOLUME MASK ---
+                            chosen_targets = sampled_targets.view(-1)
                             source_ships = (ent_t[:, :, 5] * 1000.0).view(-1)
                             send_25 = source_ships * 0.25
                             send_50 = source_ships * 0.50
                             send_75 = source_ships * 0.75
+                            send_100 = source_ships * 1.0
+                            
                             trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=device)
-                            trickle_mask[:, 1] = send_25 < 15
-                            trickle_mask[:, 2] = send_50 < 15
-                            trickle_mask[:, 3] = send_75 < 15
+                            trickle_mask[:, 1] = send_25 < 15.0
+                            trickle_mask[:, 2] = send_50 < 15.0
+                            trickle_mask[:, 3] = send_75 < 15.0
+                            trickle_mask[:, 4] = send_100 < 15.0
+                            trickle_mask[:, 5] = True
+                            
+                            target_is_owned = (ent_t[batch_idx, chosen_targets, 2] == 1.0)
+                            trickle_mask[target_is_owned, 1] = True
+                            trickle_mask[target_is_owned, 2] = True
+                            trickle_mask[target_is_owned, 3] = True
+                            
                             selected_alloc_logits[trickle_mask] = -1e9
                             # -----------------------------
 
@@ -287,15 +309,27 @@ def train(args):
                             t_acts = t_logits.squeeze(0).argmax(dim=-1)
                             selected_alloc_logits_o = a_logits.squeeze(0)[source_idx_o, t_acts, :]
                             
+                            # --- THE SMART VOLUME MASK ---
                             source_ships_o = (ent_o[:, :, 5] * 1000.0).view(-1)
                             send_25_o = source_ships_o * 0.25
                             send_50_o = source_ships_o * 0.50
                             send_75_o = source_ships_o * 0.75
+                            send_100_o = source_ships_o * 1.0
+                            
                             trickle_mask_o = torch.zeros((source_ships_o.shape[0], 6), dtype=torch.bool, device=device)
-                            trickle_mask_o[:, 1] = send_25_o < 15
-                            trickle_mask_o[:, 2] = send_50_o < 15
-                            trickle_mask_o[:, 3] = send_75_o < 15
+                            trickle_mask_o[:, 1] = send_25_o < 15.0
+                            trickle_mask_o[:, 2] = send_50_o < 15.0
+                            trickle_mask_o[:, 3] = send_75_o < 15.0
+                            trickle_mask_o[:, 4] = send_100_o < 15.0
+                            trickle_mask_o[:, 5] = True
+                            
+                            target_is_owned_o = (ent_o[0, t_acts, 2] == 1.0)
+                            trickle_mask_o[target_is_owned_o, 1] = True
+                            trickle_mask_o[target_is_owned_o, 2] = True
+                            trickle_mask_o[target_is_owned_o, 3] = True
+                            
                             selected_alloc_logits_o[trickle_mask_o] = -1e9
+                            # -----------------------------
                             
                             a_acts = selected_alloc_logits_o.argmax(dim=-1).cpu().numpy().tolist()
                             t_acts = t_acts.cpu().numpy().tolist()
@@ -326,14 +360,24 @@ def train(args):
         print(f"E{episode} | Opps: {opp_names} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
         
         if len(returns_buffer) >= args.batch_size:
-            ent_start, ent_end = 0.01, 0.001
+            # FINE-TUNING DECAY: 10x smaller to protect BC weights
+            lr_start = 1e-5
+            lr_end = 1e-6
             decay_fraction = min(1.0, total_steps / args.total_timesteps)
+            config["learning_rate"] = lr_start - decay_fraction * (lr_start - lr_end)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = config["learning_rate"]
+
+            # FINE-TUNING ENTROPY: Stop it from hallucinating random moves
+            ent_start = 0.002
+            ent_end = 0.0001
             config["entropy_coef"] = ent_start - decay_fraction * (ent_start - ent_end)
+
             rollout_data = {'obs': np.array(obs_buffer), 'targets': targets_buffer, 'allocs': allocs_buffer, 'log_probs': log_probs_buffer, 'returns': returns_buffer, 'advantages': advantages_buffer}
             model.train(); up_metrics = ppo_update(model, optimizer, rollout_data, config, epochs=config["n_epochs"], minibatch_size=config["minibatch_size"])
             print(f"\n--- PPO Update @ Step {total_steps} ---")
             print(f"Policy Loss: {up_metrics['pg_loss']:.4f} | Value Loss: {up_metrics['v_loss']:.4f} | Entropy: {up_metrics['entropy']:.4f}")
-            print(f"Dense Weight: 0.000 | Entropy Coef: {config['entropy_coef']:.4f}")
+            print(f"Learning Rate: {config['learning_rate']:.7f} | Entropy Coef: {config['entropy_coef']:.4f}")
             print("------------------------------------\n")
             
             os.makedirs("checkpoints", exist_ok=True)
