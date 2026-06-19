@@ -17,7 +17,7 @@ from kaggle_environments import make
 from orbit_wars_ai.environment.wrapper import OrbitWarsWrapper
 from orbit_wars_ai.environment.observation_processor import ObservationProcessor
 from orbit_wars_ai.environment.action_processor import ActionProcessor
-from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel
+from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel, load_checkpoint_with_surgery
 from orbit_wars_ai.agents.baseline.heuristic import HeuristicBaseline
 
 class EvaluationTournament:
@@ -33,7 +33,7 @@ class EvaluationTournament:
         
         self.model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=max_entities)
         if os.path.exists(agent_path):
-            self.model.load_state_dict(torch.load(agent_path, map_location=device))
+            load_checkpoint_with_surgery(self.model, agent_path, device)
             print(f"Loaded tournament candidate weights from: {agent_path}")
         else:
             print(f"⚠️ Checkpoint not found at {agent_path}. Evaluating uninitialized network.")
@@ -41,7 +41,7 @@ class EvaluationTournament:
         self.model.to(device)
         self.model.eval()
 
-    def get_agent_actions(self, p_obs: dict, raw_obs: dict, player_id: int) -> list:
+    def get_agent_actions(self, p_obs: dict, raw_obs: dict, player_id: int, min_ships: float = 1.0) -> list:
         # FIX: Use 2D pairwise mask directly from wrapper
         full_mask = self.wrapper.get_action_mask(raw_obs, player_id=player_id)
         action_masks_grid = np.zeros((self.max_entities, self.max_entities), dtype=bool)
@@ -59,20 +59,31 @@ class EvaluationTournament:
             batch_idx = torch.arange(self.max_entities, device=self.device)
             selected_alloc_logits = alloc_logits.squeeze(0)[batch_idx, sampled_targets, :]
 
-            # --- THE SMART VOLUME MASK ---
-            source_ships = (ent_t.squeeze(0)[:, 5] * 1000.0)
-            send_25 = source_ships * 0.25
-            send_50 = source_ships * 0.50
-            send_75 = source_ships * 0.75
+            # --- THE SMART VOLUME MASK (101 Vectorized Bins) ---
+            source_ships = (ent_t.squeeze(0)[:, 9] * 1000.0)
+            target_is_owned = (ent_t.squeeze(0)[sampled_targets, 2] == 1.0)
+            target_ships = (ent_t.squeeze(0)[sampled_targets, 9] * 1000.0)
+            is_attack = ~target_is_owned
             
-            trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=self.device)
-            trickle_mask[:, 1] = send_25 < 20
-            trickle_mask[:, 2] = send_50 < 20
-            trickle_mask[:, 3] = send_75 < 20
-            trickle_mask[:, 5] = source_ships < 20
+            # For bins 0-75 (absolute counts):
+            sends_abs = torch.arange(76, device=self.device).unsqueeze(0).expand(source_ships.shape[0], -1).float()
+            sends_abs = torch.min(sends_abs, source_ships.unsqueeze(1))
+            # For bins 76-100 (percentages):
+            pcts = torch.linspace(0.0, 1.0, 25, device=self.device)
+            sends_pct = (source_ships.unsqueeze(1) * pcts).int().float()
+            sends = torch.cat([sends_abs, sends_pct], dim=1) # Shape: (N, 101)
+            
+            is_attack_val = is_attack.unsqueeze(1)
+            target_ships_val = target_ships.unsqueeze(1)
+            
+            trickle_mask = (sends < min_ships) & (~is_attack_val | (sends <= target_ships_val))
+            trickle_mask[:, 0] = False
+            
+            # THE SHUFFLE MASK: Block useless intra-empire shuffling for 1% to 99%
+            trickle_mask[target_is_owned, 1:100] = True
             
             selected_alloc_logits[trickle_mask] = -1e9
-            # -----------------------------
+            # ----------------------------------------------------
             
             sampled_allocs = selected_alloc_logits.argmax(dim=-1)
 

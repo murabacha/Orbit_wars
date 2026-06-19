@@ -59,7 +59,12 @@ class RewardShaper:
                 # NO CONSOLATION PRIZES. If timer runs out, penalize for surviving enemies.
                 terminal_reward = -300.0 * enemy_planets_now 
                 
-        step_reward = planet_capture_reward + prod_reward + prod_penalty + time_penalty + terminal_reward
+        # Calculate active curriculum weight (annealing linearly from 1.0 to 0.0)
+        dense_weight = max(0.0, 1.0 - (current_global_step / self.total_training_steps))
+        self.last_dense_weight = dense_weight
+        
+        dense_reward = planet_capture_reward + prod_reward + prod_penalty + time_penalty
+        step_reward = (dense_reward * dense_weight) + terminal_reward
         total_reward = step_reward / self.GLOBAL_REWARD_SCALE
         
         # Update anchors

@@ -56,7 +56,7 @@ class OrbitWarsWrapper:
         
         # FIX: Align orbit check with elite_heuristic's ROTATION_LIMIT
         if rad + target_radius < 50.0:
-            angular_velocity = obs.get('planet_angular_velocities', {}).get(target_id, target_data.get('angular_velocity', 0.02))
+            angular_velocity = obs.get('angular_velocity', obs.get('planet_angular_velocities', {}).get(target_id, target_data.get('angular_velocity', 0.02)))
             initial_angle = math.atan2(dy, dx)
             future_angle = initial_angle + (angular_velocity * travel_time)
             return center + rad * math.cos(future_angle), center + rad * math.sin(future_angle)

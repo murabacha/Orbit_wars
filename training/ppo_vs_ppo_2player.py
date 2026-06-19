@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from training.render_custom_match import render_match
 
 if __name__ == "__main__":
-    checkpoint1 = "checkpoints/ppo_step_210284.pt"
+    checkpoint1 = "checkpoints/ppo_step_8977.pt"
     checkpoint2 = "checkpoints/bc_pretrained1.pt"
     
     # Check if files exist

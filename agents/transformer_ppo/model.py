@@ -39,7 +39,7 @@ class TransformerPPOModel(nn.Module):
         self.allocation_head = nn.Sequential(
             nn.Linear(64, 64),
             nn.GELU(),
-            nn.Linear(64, 6)
+            nn.Linear(64, 101)
         )
         
         self.critic_head = nn.Sequential(
@@ -77,3 +77,57 @@ class TransformerPPOModel(nn.Module):
         # FIX 5: Detach global_latent to protect shared trunk from value loss explosions
         value = self.critic_head(global_latent.detach())
         return target_logits, allocation_logits, value
+
+def load_checkpoint_with_surgery(model: nn.Module, path: str, device: torch.device) -> None:
+    state_dict = torch.load(path, map_location=device)
+    model_state = model.state_dict()
+    
+    if 'allocation_head.2.weight' in state_dict:
+        ckpt_weight = state_dict['allocation_head.2.weight']
+        ckpt_bias = state_dict['allocation_head.2.bias']
+        model_weight = model_state['allocation_head.2.weight']
+        
+        if ckpt_weight.shape != model_weight.shape:
+            # We have a shape mismatch. We perform weight surgery!
+            # ckpt_weight shape is (6, 64), model_weight shape is (101, 64)
+            new_weight = torch.zeros_like(model_weight)
+            new_bias = torch.zeros_like(model_state['allocation_head.2.bias'])
+            
+            # Map discrete percentage indices to hybrid 101 bins
+            # Bins 0-75 represent absolute counts 0 to 75
+            # Bins 76-100 represent percentages 0% to 100% (mapped to old indices 0 to 4)
+            
+            # 1. Bins 0-75 (absolute counts): interpolate from 0% (old idx 0) to 25% (old idx 1)
+            for i in range(76):
+                frac = i / 75.0
+                new_weight[i] = (1.0 - frac) * ckpt_weight[0] + frac * ckpt_weight[1]
+                new_bias[i] = (1.0 - frac) * ckpt_bias[0] + frac * ckpt_bias[1]
+                
+            # 2. Bins 76-82: interpolate from old idx 0 (0%) to old idx 1 (25%)
+            for i in range(76, 83):
+                frac = (i - 76) / 6.0
+                new_weight[i] = (1.0 - frac) * ckpt_weight[0] + frac * ckpt_weight[1]
+                new_bias[i] = (1.0 - frac) * ckpt_bias[0] + frac * ckpt_bias[1]
+                
+            # 3. Bins 82-88: interpolate from old idx 1 (25%) to old idx 2 (50%)
+            for i in range(82, 89):
+                frac = (i - 82) / 6.0
+                new_weight[i] = (1.0 - frac) * ckpt_weight[1] + frac * ckpt_weight[2]
+                new_bias[i] = (1.0 - frac) * ckpt_bias[1] + frac * ckpt_bias[2]
+                
+            # 4. Bins 88-94: interpolate from old idx 2 (50%) to old idx 3 (75%)
+            for i in range(88, 95):
+                frac = (i - 88) / 6.0
+                new_weight[i] = (1.0 - frac) * ckpt_weight[2] + frac * ckpt_weight[3]
+                new_bias[i] = (1.0 - frac) * ckpt_bias[2] + frac * ckpt_bias[3]
+                
+            # 5. Bins 94-100: interpolate from old idx 3 (75%) to old idx 4 (100%)
+            for i in range(94, 101):
+                frac = (i - 94) / 6.0
+                new_weight[i] = (1.0 - frac) * ckpt_weight[3] + frac * ckpt_weight[4]
+                new_bias[i] = (1.0 - frac) * ckpt_bias[3] + frac * ckpt_bias[4]
+                
+            state_dict['allocation_head.2.weight'] = new_weight
+            state_dict['allocation_head.2.bias'] = new_bias
+            
+    model.load_state_dict(state_dict)

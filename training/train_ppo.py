@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from kaggle_environments import make
 
-from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel
+from orbit_wars_ai.agents.transformer_ppo.model import TransformerPPOModel, load_checkpoint_with_surgery
 from orbit_wars_ai.agents.baseline.heuristic import HeuristicBaseline
 from orbit_wars_ai.agents.baseline.elite_heuristic import agent as elite_heuristic_func
 from online_agents.agent_1.main import agent as online_agent_1_func
@@ -40,7 +40,7 @@ def compute_gae(rewards, values, dones, gamma, gae_lambda, last_value):
     returns = advantages + values
     return advantages, returns
 
-def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_actions, action_masks=None):
+def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_actions, action_masks=None, min_ships=15.0):
     target_logits, alloc_logits, values = model(entities, entity_ids, mask, action_masks)
     B, N, _ = entities.shape
     target_dist = torch.distributions.Categorical(logits=target_logits)
@@ -49,28 +49,40 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     chosen_targets = target_actions.view(-1)
     selected_alloc_logits = alloc_logits[batch_idx, source_idx, chosen_targets, :]
     
-    # --- THE SMART VOLUME MASK ---
-    source_ships = (entities[:, :, 5] * 1000.0).view(-1)
-    send_25 = source_ships * 0.25
-    send_50 = source_ships * 0.50
-    send_75 = source_ships * 0.75
-    send_100 = source_ships * 1.0
-
-    trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=entities.device)
-    trickle_mask[:, 1] = send_25 < 15.0
-    trickle_mask[:, 2] = send_50 < 15.0
-    trickle_mask[:, 3] = send_75 < 15.0
-    trickle_mask[:, 4] = send_100 < 15.0 # FIX: Mask 100% for tiny planets
-    trickle_mask[:, 5] = True # FIX: Allocation 5 is permanently dead
-    
-    # THE SHUFFLE MASK: Block useless intra-empire shuffling
+    # --- THE SMART VOLUME MASK (101 Vectorized Bins) ---
+    source_ships = (entities[:, :, 9] * 1000.0).view(-1)
     target_is_owned = (entities[batch_idx, chosen_targets, 2] == 1.0)
-    trickle_mask[target_is_owned, 1] = True
-    trickle_mask[target_is_owned, 2] = True
-    trickle_mask[target_is_owned, 3] = True
+    target_ships = (entities[batch_idx, chosen_targets, 9] * 1000.0)
+    is_attack = ~target_is_owned
+    
+    # Expand min_ships tensor to shape (B * N, 1)
+    if isinstance(min_ships, torch.Tensor):
+        if min_ships.dim() == 1 and min_ships.shape[0] == B:
+            min_ships_val = min_ships.unsqueeze(1).expand(-1, N).reshape(-1, 1)
+        else:
+            min_ships_val = min_ships.view(-1, 1)
+    else:
+        min_ships_val = min_ships
+
+    # For bins 0-75 (absolute counts):
+    sends_abs = torch.arange(76, device=entities.device).unsqueeze(0).expand(source_ships.shape[0], -1).float()
+    sends_abs = torch.min(sends_abs, source_ships.unsqueeze(1))
+    # For bins 76-100 (percentages):
+    pcts = torch.linspace(0.0, 1.0, 25, device=entities.device)
+    sends_pct = (source_ships.unsqueeze(1) * pcts).int().float()
+    sends = torch.cat([sends_abs, sends_pct], dim=1) # Shape: (B * N, 101)
+    
+    is_attack_val = is_attack.unsqueeze(1)
+    target_ships_val = target_ships.unsqueeze(1)
+    
+    trickle_mask = (sends < min_ships_val) & (~is_attack_val | (sends <= target_ships_val))
+    trickle_mask[:, 0] = False  # 0% is always allowed (do-nothing)
+    
+    # THE SHUFFLE MASK: Block useless intra-empire shuffling for 1% to 99%
+    trickle_mask[target_is_owned, 1:100] = True
 
     selected_alloc_logits[trickle_mask] = -1e9
-    # -----------------------------
+    # ----------------------------------------------------
 
     alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits)
     is_source_owned = (entities[:, :, 2] == 1.0)
@@ -96,6 +108,7 @@ def ppo_update(model: nn.Module, optimizer: optim.Optimizer, rollout_data: dict,
     dataset_size = len(obs_batch)
     inds = np.arange(dataset_size)
     metrics = {"pg_loss": [], "v_loss": [], "entropy": []}
+    min_ships_batch = torch.tensor(np.array(rollout_data['min_ships']), dtype=torch.float32, device=device)
     for epoch in range(epochs):
         np.random.shuffle(inds)
         for start in range(0, dataset_size, minibatch_size):
@@ -108,7 +121,7 @@ def ppo_update(model: nn.Module, optimizer: optim.Optimizer, rollout_data: dict,
             amasks = torch.tensor(np.stack([o['action_masks'] for o in mb_obs]), dtype=torch.bool, device=device)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
-                new_log_probs, entropy, values = get_joint_log_prob(model, entities, ids, mask, action_targets[mb_inds], action_allocs[mb_inds], amasks)
+                new_log_probs, entropy, values = get_joint_log_prob(model, entities, ids, mask, action_targets[mb_inds], action_allocs[mb_inds], amasks, min_ships=min_ships_batch[mb_inds])
                 ratio = torch.exp(new_log_probs - old_log_probs[mb_inds])
                 surr1 = ratio * advantages[mb_inds]
                 surr2 = torch.clamp(ratio, 1.0 - config["clip_range"], 1.0 + config["clip_range"]) * advantages[mb_inds]
@@ -146,7 +159,7 @@ def train(args):
     model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=config["max_entities"])
     checkpoint_path = args.checkpoint if args.checkpoint else args.bc_checkpoint
     if checkpoint_path and os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        load_checkpoint_with_surgery(model, checkpoint_path, device)
         print(f"Loaded checkpoint from: {checkpoint_path}")
     model.to(device)
     
@@ -169,6 +182,7 @@ def train(args):
     episode = 0
     obs_buffer, targets_buffer, allocs_buffer = [], [], []
     log_probs_buffer, returns_buffer, advantages_buffer = [], [], []
+    min_ships_buffer = []
 
     while total_steps < args.total_timesteps:
         episode += 1
@@ -212,7 +226,7 @@ def train(args):
                     loaded_opponents_cache[opp_path] = torch.load(opp_path, map_location=device)
                 
                 temp_model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=200).to(device)
-                temp_model.load_state_dict(loaded_opponents_cache[opp_path])
+                load_checkpoint_with_surgery(temp_model, opp_path, device)
                 temp_model.eval()
                 opp_models.append(temp_model)
             
@@ -222,13 +236,17 @@ def train(args):
             opponent_paths = ["baseline_heuristic"] * (num_players - 1)
         
         ep_obs, ep_targets, ep_allocs, ep_logp, ep_values, ep_rewards, ep_dones = [], [], [], [], [], [], []
+        ep_min_ships = []
         total_ep_reward = 0
+        total_ep_actions = 0
         done = False
         steps_counter = 0
         my_slot = 0
         baselines = [HeuristicBaseline(pid) for pid in range(num_players)]
         
         while not done and steps_counter < 500:
+            progress = min(1.0, total_steps / args.total_timesteps)
+            min_ships_limit = max(1.0, 15.0 - progress * 14.0)
             actions = [[] for _ in range(num_players)]
             for pid in range(num_players):
                 if obs_list[pid]['status'] != 'ACTIVE': continue
@@ -252,27 +270,33 @@ def train(args):
                             batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N).reshape(-1); source_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).reshape(-1)
                             selected_alloc_logits = alloc_logits[batch_idx, source_idx, sampled_targets.view(-1), :]
                             
-                            # --- THE SMART VOLUME MASK ---
+                            # --- THE SMART VOLUME MASK (101 Vectorized Bins) ---
                             chosen_targets = sampled_targets.view(-1)
-                            source_ships = (ent_t[:, :, 5] * 1000.0).view(-1)
-                            send_25 = source_ships * 0.25
-                            send_50 = source_ships * 0.50
-                            send_75 = source_ships * 0.75
-                            send_100 = source_ships * 1.0
-                            
-                            trickle_mask = torch.zeros((source_ships.shape[0], 6), dtype=torch.bool, device=device)
-                            trickle_mask[:, 1] = send_25 < 15.0
-                            trickle_mask[:, 2] = send_50 < 15.0
-                            trickle_mask[:, 3] = send_75 < 15.0
-                            trickle_mask[:, 4] = send_100 < 15.0
-                            trickle_mask[:, 5] = True
+                            source_ships = (ent_t[:, :, 9] * 1000.0).view(-1)
                             
                             target_is_owned = (ent_t[batch_idx, chosen_targets, 2] == 1.0)
-                            trickle_mask[target_is_owned, 1] = True
-                            trickle_mask[target_is_owned, 2] = True
-                            trickle_mask[target_is_owned, 3] = True
+                            target_ships = (ent_t[batch_idx, chosen_targets, 9] * 1000.0)
+                            is_attack = ~target_is_owned
+                            
+                            # For bins 0-75 (absolute counts):
+                            sends_abs = torch.arange(76, device=device).unsqueeze(0).expand(source_ships.shape[0], -1).float()
+                            sends_abs = torch.min(sends_abs, source_ships.unsqueeze(1))
+                            # For bins 76-100 (percentages):
+                            pcts = torch.linspace(0.0, 1.0, 25, device=device)
+                            sends_pct = (source_ships.unsqueeze(1) * pcts).int().float()
+                            sends = torch.cat([sends_abs, sends_pct], dim=1) # Shape: (N, 101)
+                            
+                            is_attack_val = is_attack.unsqueeze(1)
+                            target_ships_val = target_ships.unsqueeze(1)
+                            
+                            trickle_mask = (sends < min_ships_limit) & (~is_attack_val | (sends <= target_ships_val))
+                            trickle_mask[:, 0] = False
+                            
+                            # Block shuffling for 1% to 99%
+                            trickle_mask[target_is_owned, 1:100] = True
                             
                             selected_alloc_logits[trickle_mask] = -1e9
+                            # ----------------------------------------------------
                             # -----------------------------
 
                             alloc_dist = torch.distributions.Categorical(logits=selected_alloc_logits); sampled_allocs = alloc_dist.sample().view(B, N)
@@ -280,7 +304,9 @@ def train(args):
                             log_p_target = target_dist.log_prob(sampled_targets); log_p_alloc = alloc_dist.log_prob(sampled_allocs.view(-1)).view(B, N)
                             joint_log_prob = (((log_p_target + log_p_alloc) * torch.tensor(valid_source_mask, device=device).float()).sum(dim=-1)).item()
                     
-                    actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist())
+                    actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=sampled_targets.squeeze(0).cpu().numpy().tolist(), allocation_indices=sampled_allocs.squeeze(0).cpu().numpy().tolist(), min_ships=min_ships_limit)
+                    total_ep_actions += len(actions[pid])
+                    ep_min_ships.append(min_ships_limit)
                     processed['action_masks'] = action_masks_grid; ep_obs.append(processed); ep_targets.append(sampled_targets.squeeze(0).cpu().numpy()); ep_allocs.append(sampled_allocs.squeeze(0).cpu().numpy()); ep_logp.append(joint_log_prob); ep_values.append(value_t.item()); ep_dones.append(False)
                 else:
                     opp_idx = pid - 1
@@ -309,31 +335,36 @@ def train(args):
                             t_acts = t_logits.squeeze(0).argmax(dim=-1)
                             selected_alloc_logits_o = a_logits.squeeze(0)[source_idx_o, t_acts, :]
                             
-                            # --- THE SMART VOLUME MASK ---
-                            source_ships_o = (ent_o[:, :, 5] * 1000.0).view(-1)
-                            send_25_o = source_ships_o * 0.25
-                            send_50_o = source_ships_o * 0.50
-                            send_75_o = source_ships_o * 0.75
-                            send_100_o = source_ships_o * 1.0
-                            
-                            trickle_mask_o = torch.zeros((source_ships_o.shape[0], 6), dtype=torch.bool, device=device)
-                            trickle_mask_o[:, 1] = send_25_o < 15.0
-                            trickle_mask_o[:, 2] = send_50_o < 15.0
-                            trickle_mask_o[:, 3] = send_75_o < 15.0
-                            trickle_mask_o[:, 4] = send_100_o < 15.0
-                            trickle_mask_o[:, 5] = True
-                            
+                            # --- THE SMART VOLUME MASK (101 Vectorized Bins) ---
+                            source_ships_o = (ent_o[:, :, 9] * 1000.0).view(-1)
                             target_is_owned_o = (ent_o[0, t_acts, 2] == 1.0)
-                            trickle_mask_o[target_is_owned_o, 1] = True
-                            trickle_mask_o[target_is_owned_o, 2] = True
-                            trickle_mask_o[target_is_owned_o, 3] = True
+                            target_ships_o = (ent_o[0, t_acts, 9] * 1000.0)
+                            is_attack_o = ~target_is_owned_o
+                            
+                            # For bins 0-75 (absolute counts):
+                            sends_abs_o = torch.arange(76, device=device).unsqueeze(0).expand(source_ships_o.shape[0], -1).float()
+                            sends_abs_o = torch.min(sends_abs_o, source_ships_o.unsqueeze(1))
+                            # For bins 76-100 (percentages):
+                            pcts = torch.linspace(0.0, 1.0, 25, device=device)
+                            sends_pct_o = (source_ships_o.unsqueeze(1) * pcts).int().float()
+                            sends_o = torch.cat([sends_abs_o, sends_pct_o], dim=1) # Shape: (N, 101)
+                            
+                            is_attack_val_o = is_attack_o.unsqueeze(1)
+                            target_ships_val_o = target_ships_o.unsqueeze(1)
+                            
+                            trickle_mask_o = (sends_o < min_ships_limit) & (~is_attack_val_o | (sends_o <= target_ships_val_o))
+                            trickle_mask_o[:, 0] = False
+                            
+                            # Block shuffling for 1% to 99%
+                            trickle_mask_o[target_is_owned_o, 1:100] = True
                             
                             selected_alloc_logits_o[trickle_mask_o] = -1e9
+                            # ----------------------------------------------------
                             # -----------------------------
                             
                             a_acts = selected_alloc_logits_o.argmax(dim=-1).cpu().numpy().tolist()
                             t_acts = t_acts.cpu().numpy().tolist()
-                        actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=t_acts, allocation_indices=a_acts)
+                        actions[pid] = act_proc.process_actions(raw_obs, player_id=pid, target_indices=t_acts, allocation_indices=a_acts, min_ships=min_ships_limit)
             
             obs_list = env.step(actions)
             real_done = (obs_list[my_slot].get('status') != 'ACTIVE') or all(s['status'] != 'ACTIVE' for i, s in enumerate(obs_list) if i != my_slot)
@@ -355,9 +386,10 @@ def train(args):
                 
         ep_adv, ep_ret = compute_gae(np.array(ep_rewards), np.array(ep_values), np.array(ep_dones), config["gamma"], config["gae_lambda"], bootstrap_val)
         obs_buffer.extend(ep_obs); targets_buffer.extend(ep_targets); allocs_buffer.extend(ep_allocs); log_probs_buffer.extend(ep_logp); advantages_buffer.extend(ep_adv); returns_buffer.extend(ep_ret)
+        min_ships_buffer.extend(ep_min_ships)
         
         opp_names = [os.path.basename(p) if '/' in p else p for p in opponent_paths]
-        print(f"E{episode} | Opps: {opp_names} | Steps: {steps_counter} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
+        print(f"E{episode} | Opps: {opp_names} | Steps: {steps_counter} | Actions: {total_ep_actions} | Reward: {total_ep_reward:.2f} | Buffer: {len(returns_buffer)}/{args.batch_size}")
         
         if len(returns_buffer) >= args.batch_size:
             # FINE-TUNING DECAY: 10x smaller to protect BC weights
@@ -373,11 +405,12 @@ def train(args):
             ent_end = 0.0001
             config["entropy_coef"] = ent_start - decay_fraction * (ent_start - ent_end)
 
-            rollout_data = {'obs': np.array(obs_buffer), 'targets': targets_buffer, 'allocs': allocs_buffer, 'log_probs': log_probs_buffer, 'returns': returns_buffer, 'advantages': advantages_buffer}
+            rollout_data = {'obs': np.array(obs_buffer), 'targets': targets_buffer, 'allocs': allocs_buffer, 'log_probs': log_probs_buffer, 'returns': returns_buffer, 'advantages': advantages_buffer, 'min_ships': min_ships_buffer}
             model.train(); up_metrics = ppo_update(model, optimizer, rollout_data, config, epochs=config["n_epochs"], minibatch_size=config["minibatch_size"])
+            current_dense_weight = getattr(reward_shaper, 'last_dense_weight', 0.0)
             print(f"\n--- PPO Update @ Step {total_steps} ---")
             print(f"Policy Loss: {up_metrics['pg_loss']:.4f} | Value Loss: {up_metrics['v_loss']:.4f} | Entropy: {up_metrics['entropy']:.4f}")
-            print(f"Learning Rate: {config['learning_rate']:.7f} | Entropy Coef: {config['entropy_coef']:.4f}")
+            print(f"Dense Weight: {current_dense_weight:.4f} | Learning Rate: {config['learning_rate']:.7f} | Entropy Coef: {config['entropy_coef']:.4f}")
             print("------------------------------------\n")
             
             os.makedirs("checkpoints", exist_ok=True)
@@ -394,6 +427,7 @@ def train(args):
                 try: shutil.copy2(local_save_path, os.path.join(gdrive_path, f'ppo_step_{total_steps}.pt'))
                 except: pass
             obs_buffer, targets_buffer, allocs_buffer, log_probs_buffer, returns_buffer, advantages_buffer = [], [], [], [], [], []
+            min_ships_buffer = []
     print("Training complete")
 
 if __name__ == '__main__':
