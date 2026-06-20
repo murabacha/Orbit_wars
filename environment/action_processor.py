@@ -57,11 +57,6 @@ class ActionProcessor:
                 if not (is_attack and num_ships > target.ships):
                     continue
                 
-            # THE SHUFFLING FIX:
-            # Prevent moving ships to our own planets unless using 100% (evacuation, bin 100)
-            if target.owner == player_id and alloc_idx != 100:
-                continue
-            
             # 3. Final Intercept Calculation
             angle, travel_time, tx, ty = self.wrapper.get_intercept_params((source.x, source.y), source.radius, target_data, allocation_pct, obs)
             

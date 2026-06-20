@@ -14,15 +14,15 @@ from orbit_wars_ai.environment.observation_processor import ObservationProcessor
 from orbit_wars_ai.environment.wrapper import OrbitWarsWrapper
 
 def alloc_to_index(ships_to_send: int, source_ships: int) -> int:
-    if source_ships <= 0: return 0
-    frac = ships_to_send / float(source_ships)
-    bins = [0.0, 0.25, 0.5, 0.75, 1.0]
-    idx, best_diff = 0, float('inf')
-    for i, b in enumerate(bins):
-        d = abs(frac - b)
-        if d < best_diff:
-            best_diff, idx = d, i
-    return 5 if best_diff > 0.12 else idx
+    if source_ships <= 0 or ships_to_send <= 0:
+        return 0
+    ships_to_send = min(ships_to_send, source_ships)
+    if ships_to_send <= 75:
+        return ships_to_send
+    pct = ships_to_send / float(source_ships)
+    bin_idx = int(round(pct * 24.0))
+    bin_idx = max(0, min(24, bin_idx))
+    return 76 + bin_idx
 
 def save_dataset(save_path, entities, ids, masks, targets, allocs, returns):
     if not entities: return

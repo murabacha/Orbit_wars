@@ -78,9 +78,6 @@ def get_joint_log_prob(model, entities, entity_ids, mask, target_actions, alloc_
     trickle_mask = (sends < min_ships_val) & (~is_attack_val | (sends <= target_ships_val))
     trickle_mask[:, 0] = False  # 0% is always allowed (do-nothing)
     
-    # THE SHUFFLE MASK: Block useless intra-empire shuffling for 1% to 99%
-    trickle_mask[target_is_owned, 1:100] = True
-
     selected_alloc_logits[trickle_mask] = -1e9
     # ----------------------------------------------------
 
@@ -292,9 +289,6 @@ def train(args):
                             trickle_mask = (sends < min_ships_limit) & (~is_attack_val | (sends <= target_ships_val))
                             trickle_mask[:, 0] = False
                             
-                            # Block shuffling for 1% to 99%
-                            trickle_mask[target_is_owned, 1:100] = True
-                            
                             selected_alloc_logits[trickle_mask] = -1e9
                             # ----------------------------------------------------
                             # -----------------------------
@@ -354,10 +348,6 @@ def train(args):
                             
                             trickle_mask_o = (sends_o < min_ships_limit) & (~is_attack_val_o | (sends_o <= target_ships_val_o))
                             trickle_mask_o[:, 0] = False
-                            
-                            # Block shuffling for 1% to 99%
-                            trickle_mask_o[target_is_owned_o, 1:100] = True
-                            
                             selected_alloc_logits_o[trickle_mask_o] = -1e9
                             # ----------------------------------------------------
                             # -----------------------------

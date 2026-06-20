@@ -79,9 +79,6 @@ class EvaluationTournament:
             trickle_mask = (sends < min_ships) & (~is_attack_val | (sends <= target_ships_val))
             trickle_mask[:, 0] = False
             
-            # THE SHUFFLE MASK: Block useless intra-empire shuffling for 1% to 99%
-            trickle_mask[target_is_owned, 1:100] = True
-            
             selected_alloc_logits[trickle_mask] = -1e9
             # ----------------------------------------------------
             

@@ -78,8 +78,8 @@ def train_bc(npz_path: str, epochs: int = 5, batch_size: int = 16, lr: float = 3
     
     # NEW: Mitigate Dataset Imbalance (The "Hold Position" flood)
     # The heuristic almost never launches (alloc=0 is 95% of the data).
-    # This weight prevents the network from learning to be "dormant" forever.
-    alloc_weights = torch.tensor([0.05, 1.0, 1.0, 1.0, 1.0, 1.0], device=device)
+    alloc_weights = torch.ones(101, device=device)
+    alloc_weights[0] = 0.05
     alloc_ce_loss = nn.CrossEntropyLoss(weight=alloc_weights, reduction='none')
 
     for epoch in range(epochs):
