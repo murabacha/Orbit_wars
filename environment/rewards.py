@@ -46,18 +46,32 @@ class RewardShaper:
         prod_reward = (my_prod_now - self.prev_my_prod) * 100.0 
         prod_penalty = (enemy_prod_now - self.prev_enemy_prod) * -100.0
         
-        # 3. SPEED ENFORCER: Bleed points every step to force fast play
-        time_penalty = -0.50 
+        # 3. SPEED ENFORCER: Disabled to prevent the suicide loop
+        time_penalty = 0.0 
         
-        # 4. HYPER-AGGRESSION: The Kill Shot vs The Cowardice Penalty
+        # 4. HYPER-AGGRESSION: Clean Win/Loss Alignment
         terminal_reward = 0.0
         if done:
-            if enemy_planets_now == 0:
-                # 1000 base + massive speed bonus. Winning fast is the ONLY goal.
-                terminal_reward = 1000.0 + (500 - episode_step) * 5 
+            player_planet_counts = {}
+            for p in planets:
+                owner = p[1]
+                if owner != -1:
+                    player_planet_counts[owner] = player_planet_counts.get(owner, 0) + 1
+            
+            my_count = player_planet_counts.get(self.player_id, 0)
+            
+            is_winner = False
+            if my_count > 0:
+                is_winner = True
+                for opp, count in player_planet_counts.items():
+                    if opp != self.player_id and count >= my_count:
+                        is_winner = False
+                        break
+                        
+            if is_winner:
+                terminal_reward = 1000.0
             else:
-                # NO CONSOLATION PRIZES. If timer runs out, penalize for surviving enemies.
-                terminal_reward = -300.0 * enemy_planets_now 
+                terminal_reward = -1000.0 
                 
         # Calculate active curriculum weight (annealing linearly from 1.0 to 0.0)
         dense_weight = max(0.0, 1.0 - (current_global_step / self.total_training_steps))

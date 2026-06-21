@@ -13,9 +13,9 @@ if __name__ == "__main__":
     # Prioritize checking the submission folder for downloaded weights, fallback to latest checkpoint
     checkpoint1 = "../submission/model.pt" if os.path.exists("../submission/model.pt") else "submission/model.pt"
     if not os.path.exists(checkpoint1):
-        checkpoint1 = "checkpoints/ppo_step_797379.pt"
+        checkpoint1 = "checkpoints/bc_pretrained2.pt"
         
-    checkpoint2 = "checkpoints/ppo_step_797379.pt"
+    checkpoint2 = "checkpoints/bc_pretrained2.pt"
     
     # Check if files exist
     for cp in [checkpoint1, checkpoint2]:
