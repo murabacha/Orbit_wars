@@ -73,8 +73,8 @@ class RewardShaper:
             else:
                 terminal_reward = -1000.0 
                 
-        # Calculate active curriculum weight (annealing linearly from 1.0 to 0.0)
-        dense_weight = max(0.0, 1.0 - (current_global_step / self.total_training_steps))
+        # Calculate active curriculum weight (set to 0.0 for pure sparse win/loss training)
+        dense_weight = 0.0
         self.last_dense_weight = dense_weight
         
         dense_reward = planet_capture_reward + prod_reward + prod_penalty + time_penalty

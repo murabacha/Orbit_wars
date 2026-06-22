@@ -11,9 +11,9 @@ from training.render_custom_match import render_match
 
 if __name__ == "__main__":
     # Prioritize checking the submission folder for downloaded weights, fallback to latest checkpoint
-    checkpoint1 = "../submission/model.pt" if os.path.exists("../submission/model.pt") else "submission/model.pt"
-    if not os.path.exists(checkpoint1):
-        checkpoint1 = "checkpoints/bc_pretrained2.pt"
+    # checkpoint1 = "../submission/model.pt" if os.path.exists("../submission/model.pt") else "submission/model.pt"
+    # if not os.path.exists(checkpoint1):
+    checkpoint1 = "checkpoints/ppo_step_637852.pt"
         
     checkpoint2 = "checkpoints/bc_pretrained2.pt"
     
