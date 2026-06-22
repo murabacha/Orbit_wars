@@ -149,8 +149,8 @@ def train(args):
     config = {
         "player_id": 0, "gamma": 0.99, "gae_lambda": 0.95, "learning_rate": 1e-5,
         "clip_range": 0.05, # Max 5% policy change per update (The Straightjacket)
-        "value_coef": 0.5, "entropy_coef": 0.002, "max_entities": 200,
-        "n_epochs": 4, "minibatch_size": 16, "device": device
+        "value_coef": 0.5, "entropy_coef": 0.0005, "max_entities": 200,
+        "n_epochs": 3, "minibatch_size": 128, "device": device
     }
     
     model = TransformerPPOModel(feature_dim=18, embed_dim=128, num_heads=4, num_layers=3, max_entities=config["max_entities"])
@@ -391,8 +391,8 @@ def train(args):
                 param_group['lr'] = config["learning_rate"]
 
             # FINE-TUNING ENTROPY: Stop it from hallucinating random moves
-            ent_start = 0.002
-            ent_end = 0.0001
+            ent_start = 0.0005
+            ent_end = 0.00005
             config["entropy_coef"] = ent_start - decay_fraction * (ent_start - ent_end)
 
             rollout_data = {'obs': np.array(obs_buffer), 'targets': targets_buffer, 'allocs': allocs_buffer, 'log_probs': log_probs_buffer, 'returns': returns_buffer, 'advantages': advantages_buffer, 'min_ships': min_ships_buffer}
